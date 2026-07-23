@@ -46,13 +46,101 @@ Ask for whichever of these are relevant to what they picked, and only then:
 - **Product channel.** Codes: **Website = `2`**, **POS = `3`**, **All = `1`**. Default POS for stock-in flows from handwritten bills. Confirm if intent is unclear.
 - **Delay between products.** Default 3s. Ask if the batch is >100 or the user wants faster/slower.
 - **Images (Website / All channels only).** For POS-only uploads, skip. For Web/All:
-  - Ask whether the user has images ready (folder path? one image per row?).
+  - Ask whether the user has images ready (folder path? one image per row? URLs in a column?).
   - Fetch `customization.image_ratio` via `GET /store/{store_id}` and translate: `1`=1:1 square, `2`=4:3, `3`=16:9.
   - **Ask upfront: crop yourself (agent) or user pre-crops?** The storefront crops at render time to the store's `image_ratio` — off-center subjects will get chopped. Options:
     - User pre-crops → just upload as-is.
     - Agent auto-crops → use `sips`, Pillow (`ImageOps.fit`), or ImageMagick to center-crop to the target ratio before uploading. Confirm the ratio before batch-processing.
   - **Don't pre-convert format.** Server auto-converts raster images (JPG/PNG/HEIC) to **WebP quality 95** via sharp on upload; the returned `file_url` will end in `.webp`. SVG passes through unchanged.
   - **No code-level file-size cap**, but downscale phone photos to ~2000 px on the long edge to avoid upstream gateway caps and memory pressure. Corrupt/undecodable bytes cause a `500`.
+
+### External-image pipeline (marketplace CDN URLs → your store's CDN)
+
+When the source is a spreadsheet full of external image URLs (Daraz-style `static-01.daraz.com.np/...`, Shopify CDNs, generic marketplace exports), **always re-host on the store's CDN before creating the product** — don't just paste the external URLs into `image_urls`. External URLs technically work (verified 2026-07 on a demo store with Daraz), but:
+
+- Marketplaces can hotlink-block at any time (referrer checks change).
+- The storefront doesn't get the WebP q95 conversion → slower renders + more bandwidth.
+- No warranty the source URL persists.
+- Fixing bad `image_urls` later requires a separate edit endpoint (see "Product-edit endpoints" section). Cheaper to re-host up front than to patch afterwards. Note: `PUT/PATCH /product/{store}/{pid}`, `POST /product/edit/…`, `POST /product/{store}/edit/{pid}` all 404 — the update route is **not** at the create path.
+
+**Full pipeline for external URLs (Website/All uploads):**
+
+1. **Download** the source URL to a temp file. Send a browser `User-Agent` (marketplace CDNs sometimes 403 plain urllib).
+2. **Auto-trim dark background** so the product isn't dwarfed by studio backdrop. Marketplace studio shots frequently have 15–40% black/dark-gray padding on the sides (e.g. bag photos with a black-on-black backdrop). Use a brightness-threshold bbox trim (Pillow snippet below). Skip if the source is already a clean lifestyle shot.
+3. **Center-crop to the store's `image_ratio`** using `ImageOps.fit`. Ratios: `1`→`(1,1)`, `2`→`(4,3)`, `3`→`(16,9)`. Resize the long edge to ~1200–1600 px.
+4. **Upload** each cropped file to `POST /product/{store_id}/file` (multipart, `upload_purpose=product_image`). Response is `{file: {file_url: "https://cdn2.blanxer.com/uploads/<store_id>/product_image-<name>-<nnnn>.webp", ...}}` — server auto-converts to WebP q95.
+5. **Create the product** with `image_urls: [<file_url1>, <file_url2>, ...]` in the order you want them shown. First URL is the thumbnail.
+
+**Pillow helper — dark-background trim + ratio crop:**
+
+```python
+from PIL import Image, ImageOps, ImageChops, ImageStat
+
+RATIO_MAP = {1: (1,1), 2: (4,3), 3: (16,9)}
+
+def trim_dark_bg(im, threshold=25):
+    """Trim near-black borders. threshold=25 catches studio black + dark gray backdrops.
+    Returns the cropped image or the original if no trimmable border."""
+    gray = im.convert("L")
+    stat = ImageStat.Stat(gray.crop((0,0,im.width,1)))
+    if stat.mean[0] > threshold * 2:  # not a dark backdrop, don't touch
+        return im
+    bg = Image.new("L", gray.size, 0)
+    diff = ImageChops.difference(gray, bg)
+    diff = diff.point(lambda p: 255 if p > threshold else 0)
+    bbox = diff.getbbox()
+    if not bbox: return im
+    # Safety: don't trim more than 40% off any side
+    l, t, r, b = bbox
+    max_trim_x = int(im.width * 0.4); max_trim_y = int(im.height * 0.4)
+    l = min(l, max_trim_x); t = min(t, max_trim_y)
+    r = max(r, im.width - max_trim_x); b = max(b, im.height - max_trim_y)
+    return im.crop((l, t, r, b))
+
+def prep_for_store(src_path, out_path, image_ratio_code, target_long_edge=1400):
+    im = Image.open(src_path)
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    im = trim_dark_bg(im)
+    ar_w, ar_h = RATIO_MAP.get(image_ratio_code, (1,1))
+    if ar_w >= ar_h:
+        tw = target_long_edge; th = int(target_long_edge * ar_h / ar_w)
+    else:
+        th = target_long_edge; tw = int(target_long_edge * ar_w / ar_h)
+    im = ImageOps.fit(im, (tw, th), method=Image.LANCZOS, centering=(0.5, 0.5))
+    im.save(out_path, "JPEG", quality=92)
+```
+
+**Multipart upload snippet:**
+
+```python
+import io, uuid, urllib.request, json, mimetypes
+def upload_to_blanxer(store_id, token, cf_headers, file_path):
+    boundary = f"----blanxer{uuid.uuid4().hex}"
+    mime = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
+    body = io.BytesIO()
+    def w(s): body.write(s.encode() if isinstance(s,str) else s); body.write(b"\r\n")
+    w(f"--{boundary}")
+    w('Content-Disposition: form-data; name="upload_purpose"'); w(""); w("product_image")
+    w(f"--{boundary}")
+    w(f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"')
+    w(f"Content-Type: {mime}"); w("")
+    body.write(file_path.read_bytes()); w("")
+    w(f"--{boundary}--")
+    req = urllib.request.Request(
+        f"https://api.blanxer.com/product/{store_id}/file",
+        data=body.getvalue(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}",
+                 **cf_headers},
+        method="POST")
+    return json.loads(urllib.request.urlopen(req, timeout=60).read())["file"]["file_url"]
+```
+
+**Parallelism**: image upload is the slow phase. For >20 products, run steps 1–4 in a thread pool (5–10 workers) — the create step in step 5 stays sequential.
+
+**Fail-soft**: if one image fails, still create the product with the URLs that succeeded; log the failed source URL for later manual retry.
+
+**When to skip re-hosting**: only if the batch is a throwaway/demo AND the source CDN is known-stable AND the storefront's rendering perf doesn't matter. In every real upload, re-host.
 
 **Reprint labels** needs: product IDs (or a name substring — the reprint script accepts `BLANXER_PRODUCT_QUERY`). Nothing else.
 
@@ -381,6 +469,80 @@ If you see `403 error code: 1010`, don't retry-loop and don't fall back to fewer
 
 **⚠ Advanced-inventory stores:** when `use_advanced_inventory` is ON, the `quantity` field in the create-product payload is **ignored** — the product is created with `quantity: 0` and empty `inventory_summary`. Stock only enters via `POST /inventory/stock-in`. the user's Example Store store is in advanced-inventory mode as of 2026-07-20, so the two-step create-then-stock-in flow described above is required, not optional. If a store isn't in advanced mode yet: `POST /inventory/enable` (owner only) turns it on once.
 
+### Product-edit endpoints (4 handlers, not one)
+
+There's **no single "update product"** route. Editing an existing product is split across four handlers in `product.routes.ts:105-124`. Send the payload to the one that matches what you're changing — sending fields to the wrong handler is silently ignored.
+
+**1. `POST /product/general/{store_id}/{product_id}`** — general info + top-level images. (`edit-product-general-information.ts`, auth: owner/manager)
+
+```json
+{
+  "name": "...",                          // required, max 2000
+  "slug": "...",                          // required, min 4 (slugified server-side; unique per store)
+  "description": "...",                   // required
+  "long_description": "",                 // optional
+  "categories": ["<cat_id>"],             // string[] of category ids (unknown ids stored silently — see category note above)
+  "brand": "<brand_id>",                  // optional, must belong to store
+  "channel": 1,                           // 1=All, 2=Website, 3=POS
+  "image_urls": ["https://.../x.webp"]    // full S3 URLs; index 0 = primary/thumbnail
+}
+```
+
+**2. `POST /product/variant_inventory/{store_id}/{product_id}`** — variants + inventory + pricing. (`edit-product-variant-inventory.ts`, auth: owner/manager)
+
+```json
+{
+  "continue_selling": true,
+  "price": 0, "compare_at_price": 0, "cost_per_item": 0,
+  "weight": 0, "quantity": 0,
+  "sku": "", "exim_code": "",             // exim_code = HS code
+  "color_name": "", "size_name": "",
+  "colors": [], "sizes": [],
+  "image_urls": [...],                    // base image_urls are also settable here
+  "variants": [
+    {
+      "_id": "<existing variant _id>",    // OMIT to create a new variant
+      "option_name": "Red / L",           // used for matching (fallback if no _id)
+      "price": 0, "compare_at_price": 0, "cost_per_item": 0,
+      "quantity": 0, "weight": 0,
+      "sku": "", "exim_code": "",
+      "image_url": "https://.../variant.webp"   // per-variant image (single URL, NOT an array)
+    }
+  ]
+}
+```
+
+**Variant diff semantics — full-replace, not a patch.** The handler diffs your `variants[]` against what's stored:
+
+- Match by `option_name` first, then by `_id` → **updates** that variant's fields in place. Existing barcode is preserved.
+- No match / no `_id` → **creates** a new variant. Auto-assigns a barcode (`product.barcode + 3-digit suffix`). Cap: 500 variants/product.
+- Any existing variant not in your `variants[]` → **deleted** (`$pull`).
+
+Always send the **complete** variant set — a partial payload will delete every variant you leave out.
+
+**3. `POST /product/custom_fields/{store_id}/{product_id}`** — custom fields (per-product key/value pairs, e.g. warranty, materials).
+
+**4. `POST /product/status_metadata/{store_id}/{product_id}`** — status + SEO/meta fields (active/inactive, seo_title, seo_description, tags, releaseDate).
+
+**Two things to watch on updates:**
+
+- **Advanced-inventory stores (Platinum + `website_outlet`):** the `quantity` and `variants[].quantity` fields on handler #2 are **ignored** — the batch ledger owns stock. Adjust via `POST /inventory/stock-in` / `write-off` / `transfer-stock` instead. On non-advanced stores, these fields *are* the stock (absolute set, not delta) — the exact opposite behavior.
+- **SKU uniqueness is store-wide** (base SKU + every variant SKU). A collision throws `SKU already in use: …`. Same rule that applies on create.
+
+**Images on update — upload first, then reference.** You can't attach raw files to the update handlers. Multipart upload each new image via `POST /product/{store_id}/file`, then pass the returned `file_url` into `image_urls[]` on handler #1 or `image_url` on individual variants on handler #2. Raster inputs (JPG/PNG/HEIC) come back as `...product_image-….webp` (server-side WebP q95).
+
+**Not exposed as edit routes** (verified 2026-07 on prod, all return 404 — these are common wrong guesses):
+
+- `PUT /product/{store_id}/{product_id}`
+- `PATCH /product/{store_id}/{product_id}`
+- `POST /product/{store_id}/{product_id}` (the exact create path with a `_id` appended)
+- `POST /product/edit/{store_id}/{product_id}`
+- `POST /product/{store_id}/edit/{product_id}`
+- `POST /product/update/{store_id}/{product_id}`
+- `POST /product/{store_id}/{product_id}/edit`
+
+Use one of the four handlers above.
+
 **⚠ Product delete** (for cleaning test products or accidental uploads):
 
 ```
@@ -442,7 +604,22 @@ For non-premium stores also disable any suggestions of `bulk_add`, SMS blasts, o
 
 **Known store reference** (as of 2026-07-20): Example Store (`507f1f77bcf86cd799439011`) is on **platinum** — unlimited products, 2.75% Blanxer-Pay charge, 50 staff cap. Advanced inventory is ON. `image_ratio` is `2` (4:3). Skip this preflight for Example Store uploads unless the plan might have changed — but still worth a quick check if the batch is huge.
 
-**⚠ Advanced-inventory detection needs TWO fields, not one:**
+**⚠ Advanced-inventory detection — plan-first gate, then flags:**
+
+```python
+plan = (store.get("plan") or "").lower()
+is_advanced_inventory = (
+    plan == "platinum"
+    and store.get("use_advanced_inventory") is True
+    and bool(store.get("website_outlet"))
+)
+```
+
+**If the plan is not `platinum`, treat the store as non-advanced regardless of any flag values.** Advanced inventory is a Platinum-only server-side feature (`POST /inventory/enable` throws on any other plan), so `basic` / `premium` / `pos` / `plus` / no-plan stores can never be truly in advanced mode — if you see the flags set on a non-platinum store, it's data drift, ignore it and use the non-advanced path (put stock directly in `quantity` and `variants[].quantity` on the create call).
+
+For Platinum stores, both flags must additionally be true — `website_outlet` is only set as a side-effect of the enable migration, so a Platinum store with `use_advanced_inventory=true` but no `website_outlet` is in a half-migrated state; treat it as non-advanced too.
+
+**Legacy note — the older two-flag check (still true, but incomplete without the plan gate):**
 
 ```python
 is_advanced_inventory = store.get("use_advanced_inventory") is True and bool(store.get("website_outlet"))
