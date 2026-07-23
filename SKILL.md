@@ -469,6 +469,81 @@ If you see `403 error code: 1010`, don't retry-loop and don't fall back to fewer
 
 **⚠ Advanced-inventory stores:** when `use_advanced_inventory` is ON, the `quantity` field in the create-product payload is **ignored** — the product is created with `quantity: 0` and empty `inventory_summary`. Stock only enters via `POST /inventory/stock-in`. the user's Example Store store is in advanced-inventory mode as of 2026-07-20, so the two-step create-then-stock-in flow described above is required, not optional. If a store isn't in advanced mode yet: `POST /inventory/enable` (owner only) turns it on once.
 
+### Category endpoints (create + assign)
+
+Categories are **subdocuments on the Store** (`store.service.ts:205`), not a separate collection. So the flow is: create the category, capture the returned `_id`, then write that id into each product's `categories[]` via the general-info edit endpoint.
+
+**Step 1 — create a category.** `POST /store/{store_id}/add_category` — auth: owner/manager (`store.routes.ts:103`).
+
+```json
+{
+  "name": "Snacks",          // only field that matters — slug auto-generates
+  "parent": "",              // optional parent category _id
+  "image": "",               // optional
+  "seo_title": "",
+  "seo_description": "",
+  "seo_image": "",
+  "hide_on_product": false
+}
+```
+
+Response — grab `category._id`:
+
+```json
+{
+  "success": true,
+  "category": {
+    "_id": "68f...abc",        // ← use this id on products
+    "name": "Snacks",
+    "slug": "snacks",          // auto-generated; if duplicate or literal "new-arrivals",
+                               //   a -a1b2 suffix is appended
+    "order": 999, "views": 0,
+    "seo_title": "", "seo_description": "", "seo_image": "",
+    "hide_on_product": false
+  }
+}
+```
+
+- **No server-side dedup**: sending the same `name` twice creates two categories with different slugs. Always fetch `GET /store/{store_id}` first, scan `.categories[]` for a case-insensitive name match, and reuse the existing `_id` if it exists.
+- **Rename / edit later**: `POST /store/{store_id}/update_category/{cat_id}` (same body shape).
+
+**Step 2 — assign the category to each product.** Use handler #1 in the "Product-edit endpoints" section below: `POST /product/general/{store_id}/{product_id}` — `categories` is a **string array of category ids**.
+
+```json
+{
+  "name": "<existing name>",           // required — resend current values
+  "slug": "<existing slug>",           // required, min 4
+  "description": "<existing desc>",    // required
+  "categories": ["68f...abc"],         // ← the new category id(s); FULL REPLACE of the list
+  "channel": 1,
+  "image_urls": [ ...existing... ]     // resend so they aren't wiped
+}
+```
+
+**Two gotchas that will bite you:**
+
+- **`categories` is a replace, not an append.** To add a new category while keeping existing ones, first `GET /product/{store_id}/{product_id}` → read current `categories[]` → send `[...currentIds, newId]`. Sending just `[newId]` will drop every previously-assigned category on that product.
+- **No server-side validation of category ids.** A typo or unknown id is stored as a dangling reference — no error at write time, but the storefront shows a broken chip on the product and category filters silently miss it. Only send ids that came from the create response or from `GET /store` — never invent one.
+
+**Typical flow for a batch categorization pass:**
+
+```
+1. GET  /store/{store_id}
+        → scan .categories[] for existing name matches (case-insensitive, whitespace-trimmed)
+
+2. POST /store/{store_id}/add_category  {name, ...}
+        → capture category._id  (skip if the name already exists — reuse the existing id)
+
+3. for each product to categorize:
+     GET  /product/{store_id}/{product_id}
+          → read current name / slug / description / image_urls / categories
+     POST /product/general/{store_id}/{product_id}
+          {name, slug, description, image_urls, channel,
+           categories: [...currentCategoryIds, newCategoryId]}
+```
+
+**Cache tip for large batches**: fetch `GET /store` **once** at the start and keep `.categories[]` in memory for the entire pass. Every category create appends to that in-memory list too so subsequent lookups reuse the id instead of hitting the network. 74 products doing 74 separate `GET /store` calls is 74 wasted round trips.
+
 ### Product-edit endpoints (4 handlers, not one)
 
 There's **no single "update product"** route. Editing an existing product is split across four handlers in `product.routes.ts:105-124`. Send the payload to the one that matches what you're changing — sending fields to the wrong handler is silently ignored.
