@@ -712,7 +712,36 @@ Sibling endpoint `GET /product/generate_barcode/{store_id}/{print_id}` (no `quan
 
 **Label option query flags** (from `barcodeSchema`): all boolean — `show_name`, `show_variant`, `show_price`, `show_barcode`, `show_store`, `show_crossed_price`, `show_company_info`, `use_alt_barcode`, `prefix_barcode`, plus style switches `jewelry_tag`, `jewelry_cutout`, `mrp_label`, `mrp_center`.
 
+**⚠ Title-line logic on the default 50×25mm label (barcode-utils.ts:143-155)** — the top line of the label is chosen by an `if / else-if`, so `show_store` wins over `show_name`:
+
+```js
+if      (options.flags.show_store) → storeName.toUpperCase()
+else if (options.flags.show_name)  → productName.toUpperCase()
+```
+
+**Defaults are not what you'd guess.** Every flag in `barcodeSchema` uses `booleanField`, which has `.default(true)` (barcode-utils.ts:18-29). So **omitting `show_store` does NOT mean false — it defaults to `true` and the title becomes the store name**, regardless of what `show_name` is set to. The only flags that default to `false` are `show_crossed_price`, `jewelry_*`, `mrp_*`, `show_company_info`.
+
+**Rule: to get the product name as the title, you must send `&show_name=true&show_store=false` explicitly.** Full working GET:
+
+```
+GET /product/generate_barcode/{store_id}/{print_id}
+    ?token=<JWT>&show_name=true&show_store=false&show_price=true&show_barcode=true
+```
+
+**Layout variants where the logic differs:**
+
+- **Jewelry tag / jewelry cutout** (barcode-utils.ts:259-273, 359-373) — NOT `else-if`; both lines print. Store on line 1, product name on line 2. `show_store=false` still gets product name to the top.
+- **MRP label** (barcode-utils.ts:445-453) — only `show_name` matters for the title; prints `Product - Variant`. Store name only appears in the small "Imported & distributed by" block at the bottom.
+
+**Cross-reference in Blanxer's own clients**: the dashboard label modal defaults `show_store: false` and force-clears `show_name` when the user ticks "store". Following the same convention in this skill keeps behavior identical to the UI.
+
 **⚠ Cloudflare on the PDF GET**: contrary to the assumption that only mutating requests need browser headers, `GET /product/generate_barcode_quantity/...` also returns `403` from Cloudflare without `User-Agent` + `Origin` + `Referer` (confirmed 2026-07-20). Always send the browser headers on this GET too. The POST print-request definitely needs them (it's a POST).
+
+**Note on the barcode value itself (no separate endpoint)** — the scannable code on each label is assigned at product creation, not generated separately:
+- `productNumber = 100 + store.product_count` (atomic `$inc` in utils.ts:169; see add-product.ts:115-116).
+- Base product → `barcode: productNumber`; variants → `${productNumber}${getVariantNumber(i+1)}` (3-digit padded, e.g. `104001`).
+- Bulk path does the same at bulk-product-add.ts:296-303.
+- Rendered as Code128 via bwip-js (barcode-utils.ts:114). No "regenerate barcode value" API exists.
 
 **Post-upload recipe (recommended for the automated flow):**
 
