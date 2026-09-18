@@ -4,7 +4,8 @@ Direct-HTTP Blanxer bulk product uploader.
 
 Companion to upload_loop.js. Use this when you have an sk_ API key rather than
 a live Chrome tab. Reads a CSV with columns product_name, qty, cost_rate,
-selling_rate and does create-product + stock-in for each row.
+selling_rate (plus an optional tags column) and does create-product +
+stock-in for each row.
 
 Environment variables:
   BLANXER_API_KEY   sk_… key (59 chars, starts with sk_). Required.
@@ -12,12 +13,21 @@ Environment variables:
   BLANXER_CSV       Path to CSV. Default: ./products.csv
   BLANXER_CHANNEL   1=All, 2=Website, 3=POS. Default: 3 (POS).
   BLANXER_DELAY_S   Seconds between products. Default: 3.
+  BLANXER_TAGS      Comma-separated tags applied to EVERY product in the run,
+                    e.g. "seller:acme,brand:nike". Optional.
   BLANXER_BARCODE_PDF  Output path for the barcode PDF. Default: <BLANXER_CSV
                        directory>/barcodes.pdf. Set to "" to skip generation.
 
 After create + stock-in, this also generates a barcode PDF (one page per unit
 of current on-hand stock) so the user can print labels immediately. The PDF is
 written next to the source CSV.
+
+Tags: the optional per-row `tags` CSV column is semicolon- or pipe-separated
+(NOT comma — that would break plain CSV), e.g. "coming_soon;color:red". Row
+tags are merged onto BLANXER_TAGS, global first, duplicates dropped, order
+preserved. Tags are sent in the create body, which is the only place they can
+be set without a second round-trip. To change tags on products that already
+exist, use manage_tags.py instead.
 
 The store_id is derived from the API key (chars 3..27) and confirmed via
 /api-key/check. Never print or log the key or the exchanged token.
@@ -30,6 +40,18 @@ OUTLET_ID = os.environ.get("BLANXER_OUTLET_ID") or sys.exit("BLANXER_OUTLET_ID r
 CSV_PATH = os.environ.get("BLANXER_CSV", "products.csv")
 CHANNEL = int(os.environ.get("BLANXER_CHANNEL", "3"))
 DELAY_S = float(os.environ.get("BLANXER_DELAY_S", "3"))
+GLOBAL_TAGS = [t.strip() for t in os.environ.get("BLANXER_TAGS", "").split(",") if t.strip()]
+
+
+def merge_tags(row_value):
+    """Global tags + this row's tags, de-duplicated, order preserved."""
+    row_tags = [t.strip() for t in (row_value or "").replace("|", ";").split(";") if t.strip()]
+    out = []
+    for t in GLOBAL_TAGS + row_tags:
+        if t not in out:
+            out.append(t)
+    return out
+
 
 if len(API_KEY) != 59 or not API_KEY.startswith("sk_"):
     sys.exit("API key must be 59 chars starting with sk_")
@@ -80,7 +102,7 @@ def post(url, body):
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
-def create_product(name, selling):
+def create_product(name, selling, tags=None):
     return post(f"{BASE}/product/{STORE_ID}", {
         "name": name, "description": "", "long_description": "",
         "continue_selling": True, "channel": CHANNEL,
@@ -91,7 +113,7 @@ def create_product(name, selling):
         "images": [], "image_urls": [],
         "sku": "", "color_name": "", "size_name": "",
         "color_codes": [], "colors": [], "sizes": [],
-        "variants": [], "custom_fields": [], "tags": [],
+        "variants": [], "custom_fields": [], "tags": tags or [],
         "releaseDate": None, "similar_products": [],
     })
 
@@ -106,20 +128,24 @@ def stock_in(product_id, qty, cost):
 
 rows = list(csv.DictReader(open(CSV_PATH)))
 print(f"Uploading {len(rows)} products with {DELAY_S}s delay (~{len(rows) * DELAY_S / 60:.1f} min)", flush=True)
+if GLOBAL_TAGS:
+    print(f"Global tags on every product: {GLOBAL_TAGS}", flush=True)
 ok, fail = 0, 0
 uploaded_pids = []  # for the barcode step
 for i, r in enumerate(rows, 1):
     name = r["product_name"]
     qty, cost, sell = int(r["qty"]), int(r["cost_rate"]), int(r["selling_rate"])
+    tags = merge_tags(r.get("tags"))
     t0 = time.time()
-    code, resp = create_product(name, sell)
+    code, resp = create_product(name, sell, tags)
     if code == 200 and resp.get("success"):
         pid = resp["product"]["_id"]
         scode, sresp = stock_in(pid, qty, cost)
         if scode == 200:
             ok += 1
             uploaded_pids.append(pid)
-            print(f"[{i:3d}/{len(rows)}] OK  {name}  (id={pid}, qty={qty}, cost={cost}, sell={sell})", flush=True)
+            tagnote = f", tags={'+'.join(tags)}" if tags else ""
+            print(f"[{i:3d}/{len(rows)}] OK  {name}  (id={pid}, qty={qty}, cost={cost}, sell={sell}{tagnote})", flush=True)
         else:
             fail += 1
             print(f"[{i:3d}/{len(rows)}] STOCK-IN FAIL {name}  code={scode}  {sresp}", flush=True)

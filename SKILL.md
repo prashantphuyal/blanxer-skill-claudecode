@@ -1,6 +1,6 @@
 ---
 name: blanxer-skill
-description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images (printed BILL FORM + handwritten notebook selling prices), per-outlet Main Branch/Branch B outlet; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges, or categories; drops a folder of handwritten bill images (e.g. "<DDMMM Entry>/Bill N/") into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup on that store. Skip only when the user explicitly wants Blanxer's native CSV importer, the dashboard UI, or a one-off single-product entry.
+description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images (printed BILL FORM + handwritten notebook selling prices), per-outlet stock-in; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks to set, add, remove, or bulk-edit product tags (coming_soon, no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirect buttons, key:value and seller:<name> facets) on one product or the whole catalogue; asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges or categories; drops a folder of handwritten bill images into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup. Skip only when the user explicitly wants Blanxer's native CSV importer or the dashboard UI.
 ---
 
 # Blanxer Product Upload
@@ -30,6 +30,7 @@ Only two things are needed just to load the skill — everything else depends on
    - Upload products from CSV/Excel/paired bill images
    - Reprint barcode labels for existing products
    - Adjust inventory (stock-in / write-off / transfer / count correction)
+   - Set or bulk-edit product tags (special tags, seller/facet tags) on existing products
    - Delete products cleanly (write-off orphan stock, then delete)
    - Orders / transactions / analytics query
 
@@ -45,6 +46,7 @@ Ask for whichever of these are relevant to what they picked, and only then:
 - **`outlet_id` / outlet name** (e.g. "Main Branch"). Resolve via `GET /inventory/outlets/:store_id`. If multiple match or none, list options and ask — don't pick.
 - **Product channel.** Codes: **Website = `2`**, **POS = `3`**, **All = `1`**. Default POS for stock-in flows from handwritten bills. Confirm if intent is unclear.
 - **Delay between products.** Default 3s. Ask if the batch is >100 or the user wants faster/slower.
+- **Tags.** Optional, but ask once — a store that uses seller/facet tags wants them set at create time, not back-filled. Accept a whole-run list (`BLANXER_TAGS`) or a per-row `tags` column. Full vocabulary and semantics in "Product tags" below.
 - **Images (Website / All channels only).** For POS-only uploads, skip. For Web/All:
   - Ask whether the user has images ready (folder path? one image per row? URLs in a column?).
   - Fetch `customization.image_ratio` via `GET /store/{store_id}` and translate: `1`=1:1 square, `2`=4:3, `3`=16:9.
@@ -432,6 +434,8 @@ The script is the source of truth for payload shape. If you need to inline a sma
 }
 ```
 
+`tags` is stored verbatim from this body — fill it here rather than editing after create. See "Product tags" below for the vocabulary.
+
 Channel mapping: `1=All`, `2=Website`, `3=POS`. Response on success: `{success: true, product: {_id: "...", ...}}`. Keep `_id` for step two.
 
 **Stock in** — `POST https://api.blanxer.com/inventory/stock-in`
@@ -595,9 +599,22 @@ There's **no single "update product"** route. Editing an existing product is spl
 
 Always send the **complete** variant set — a partial payload will delete every variant you leave out.
 
-**3. `POST /product/custom_fields/{store_id}/{product_id}`** — custom fields (per-product key/value pairs, e.g. warranty, materials).
+**3. `POST /product/custom_fields/{store_id}/{product_id}`** — **tags**, custom fields, similar products, release date. This is the *only* edit route that writes `tags`. Body (`edit-product-custom-fields.ts`):
 
-**4. `POST /product/status_metadata/{store_id}/{product_id}`** — status + SEO/meta fields (active/inactive, seo_title, seo_description, tags, releaseDate).
+```json
+{
+  "tags": ["coming_soon", "seller:acme", "color:red"],
+  "custom_fields": [],
+  "similar_products": [],
+  "release_date": "2026-09-01T00:00:00.000Z"
+}
+```
+
+**⚠ Full replace, not a patch — the biggest trap on this route.** `tags`, `custom_fields` and `similar_products` all have a zod `.default([])`. Omit any one of them and the handler writes an **empty array** over what was there. Sending only `{"tags": [...]}` silently destroys the product's custom fields and similar-product links. Always `GET /product/{store_id}/{product_id}` first, then send all three back merged. (`release_date` is the exception — it's `?? undefined`, so omitting it preserves the stored value.)
+
+The handler also recomputes `search_key` from name + categories + colors + sizes + tags, and clears the store cache.
+
+**4. `POST /product/status_metadata/{store_id}/{product_id}`** — status + SEO/meta only: `status`, `seo_title`, `seo_description`, `seo_image`, `desc_page`. **It does NOT accept `tags` or `release_date`** — those are silently dropped by zod. Use handler #3 for tags.
 
 **Two things to watch on updates:**
 
@@ -645,6 +662,66 @@ If the order is reversed (delete first, then write-off), write-off still succeed
 **Plan-tier gates (checked upfront in step 0 — see next section):**
 - **No paid plan** (`store.plan` empty/undefined) → hard cap of **15 products total**, no `bulk_add`, no SMS, no Excel export.
 - **Any of the 5 paid plans** (`pos`, `basic`, `premium`, `platinum`, `plus`) → unlimited products, `bulk_add` allowed, SMS/export unlocked.
+
+### Product tags (special/custom tags)
+
+Tags are a plain `[String]` array on the product (`product.ts` → `tags: {type: [String], default: []}`). Blanxer overloads them as **feature flags and filter facets** — a tag is not decorative, it changes storefront and admin behaviour. Treat the tag string as an exact, case-sensitive token.
+
+**The tag vocabulary** (source of truth: the dashboard's own tag-docs modal, `add_product/ui/AddCustomField.tsx` → `tagGroups`):
+
+| Tag | Group | Effect |
+|---|---|---|
+| `coming_soon` | Product display | Shows a "Coming Soon" label and disables Add-to-Cart on grid + detail page. |
+| `no_price` | Product display | Hides price, compare price and discount badges everywhere. |
+| `show_color_chips` | Product display | Shows colour chip dots on product cards. Needs colour variants with hex codes and "Show color preview" enabled. |
+| `team_order` | Ordering | Enables team/group ordering mode on the product detail page. |
+| `main` | Ordering | Product sorts first when auto-sort is active. |
+| `rd_<Label>_<Link>` | Redirect | Adds a redirect button on the product page. `+` stands in for a space — e.g. `rd_Buy+Now_https://example.com`. |
+| `ard_<Label>_<Link>` | Redirect | Same format, rendered as the secondary/alternate button style. |
+| `<key>:<value>` | Filtering | Faceted storefront filter, grouped by key — `color:red`, `size:large`, `brand:nike`. |
+| `seller:<name>` | Filtering | Assigns the product to a seller/vendor; powers the searchable Seller filter on the admin Products page. Not a storefront filter. |
+| `mirrago_tryon` | Plugins | Shows the "Virtual Try-On" button. Requires the Mirrago plugin enabled on the store. |
+
+Anything not on this list is a free-form tag: harmless, and it joins the product's text `search_key`.
+
+**The colon rule.** `generateProductSearchKey` (`product/task/utils.ts:26`) filters out every tag containing `:` before building `search_key`. So `key:value` and `seller:*` tags are **deliberately excluded from text search** — they're facets, not keywords. Don't use a colon in a tag you want searchable, and don't try to make a facet searchable by also adding a colon-free duplicate unless the user asks.
+
+**Consistency matters for facets.** `seller:` and `key:value` filters are built by scanning distinct tag values across products, so `seller:acme`, `seller:Acme` and `seller: acme` become three different sellers. Pick one spelling and reuse it for every product of that seller.
+
+#### Setting tags at upload time
+
+`tags` is accepted directly in the create-product body — `add-product.ts` spreads `...rest` into the new document, so whatever you pass is stored verbatim. No second call needed:
+
+```json
+{ "name": "...", "description": "", "continue_selling": true, "tags": ["seller:acme", "brand:nike"] }
+```
+
+`scripts/upload_direct_http.py` supports this two ways, and merges them (global first, then row, de-duplicated in order):
+
+- `BLANXER_TAGS="seller:acme,brand:nike"` — applied to **every** product in the run.
+- An optional `tags` column in the CSV — semicolon- or pipe-separated per row (commas are avoided so plain CSV stays safe): `coming_soon;color:red`.
+
+Ask the user which tags they want before the run; don't invent them. If they name a behaviour ("mark these as coming soon", "these are all from Acme"), map it to the table above rather than inventing a new token.
+
+#### Editing tags on existing products (one, some, or all)
+
+Use `scripts/manage_tags.py` — it does the read-merge-write safely, so custom fields and similar products survive:
+
+```bash
+BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py add "seller:acme"
+BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py add "coming_soon" --name-contains "diwali"
+BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py remove "coming_soon" --ids 66f…,66f…
+BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py set "brand:nike,main" --all
+BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py list
+```
+
+Modes: `add` (union, preserves existing), `remove` (subtract), `set` (replace the whole tag array — destructive, requires an explicit selector), `list` (dry inventory of which tag sits on which product). Selectors: `--all`, `--ids a,b,c`, `--name-contains <substr>`, `--has-tag <tag>`, `--channel <1|2|3>`. The script **dry-runs by default** and prints the per-product before → after diff; pass `--apply` to write. Always show the user the dry run first when the selector touches more than a handful of products.
+
+**Why a script and not a loop of one-liners:** the admin list `GET /product/{store_id}` does **not** return `tags` or `custom_fields` (see `product_list_fields` in `product.service.ts:16`) — it only gives you ids. Every tag edit therefore needs a per-product `GET /product/{store_id}/{product_id}` to read the current `tags` + `custom_fields` + `similar_products` before the POST. The script does that N+1 walk with a delay; hand-rolling it is where the custom-fields wipe happens.
+
+**Don't use the public list for this.** `GET /product/p/public/{store_id}` does return `tags`, but it's response-cached and filters out inactive and POS-channel (`channel: 3`) products — so it will silently miss most of a POS store's catalogue. Enumerate with the authed `GET /product/{store_id}`.
+
+**Neither CSV bulk path handles tags.** `bulk_add` and `bulk_edit` both validate against a fixed column list (`bulk-product-add.ts:77`, `bulk-product-edit.ts:44`) that has no `tags` column, and rows missing any required column are dropped silently. Tagging is per-product JSON only.
 
 ### 0. Preflight — read the store plan (verified live 2026-07-20)
 
@@ -820,5 +897,6 @@ Optional env vars: `BLANXER_CHANNEL` (default 3=POS), `BLANXER_DELAY_S` (default
 ## Reference
 
 - `scripts/upload_direct_http.py` — turnkey direct-HTTP uploader (sk_ key → exchange → CF headers → create + stock-in loop). Use this for API-key uploads.
+- `scripts/manage_tags.py` — add / remove / replace product tags in bulk. Reads each product first so `custom_fields` and `similar_products` survive the full-replace endpoint. Dry-runs by default.
 - `scripts/upload_loop.js` — parameterized loop you paste into the tab (browser path).
 - `references/api.md` — captured request/response examples + full endpoint reference table.

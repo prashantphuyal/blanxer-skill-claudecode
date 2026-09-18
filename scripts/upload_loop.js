@@ -17,7 +17,10 @@
  *        })
  *
  * Channel codes: 1 = All, 2 = Website, 3 = POS.
- * Each product row needs: { name, qty, costRate, sellingRate }.
+ * Each product row needs: { name, qty, costRate, sellingRate }, and may carry
+ * an optional { tags: ['coming_soon', 'seller:acme'] }. TAGS below is merged
+ * onto every row's own tags. Tags can only be set here at create time — to
+ * retag products that already exist, use scripts/manage_tags.py.
  */
 
 (() => {
@@ -29,6 +32,7 @@
   const OUTLET_ID = ''; // looked up from /inventory/outlets/{store_id}
   const CHANNEL   = 3;  // POS
   const DELAY_MS  = 3000;
+  const TAGS      = []; // applied to every product, e.g. ['seller:acme']
   // -----------------------
 
   if (!PRODUCTS.length || !STORE_ID || !OUTLET_ID) {
@@ -66,7 +70,7 @@
     sku: '',
     color_name: '', color_codes: [], size_name: '',
     colors: [], sizes: [],
-    variants: [], custom_fields: [], tags: [],
+    variants: [], custom_fields: [], tags: [...new Set([...TAGS, ...(p.tags || [])])],
     releaseDate: null, similar_products: []
   });
 

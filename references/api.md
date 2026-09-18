@@ -152,6 +152,84 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 - `DELETE /product/{store_id}/{product_id}` — delete. Owner/manager. Returns `{success: true}`. Only this exact path shape works.
 - `POST /product/{store_id}/bulk_add` — multipart file upload for bulk product creation (alternative to the loop).
 - `GET /product/pos/{store_id}` — POS product listing.
+- `GET /product/{store_id}` — authed admin list, every product regardless of status/channel. **Projection excludes `tags` and `custom_fields`** (`product_list_fields`, `product.service.ts:16`) — ids only for a tag walk.
+- `GET /product/{store_id}/{product_id}` — full product doc (`toJSON()` minus `__v`), flat, not wrapped in `{success}`. The read half of any tag edit.
+- `POST /product/general/{store_id}/{product_id}` — name/description/price/images/categories.
+- `POST /product/variant_inventory/{store_id}/{product_id}` — variants + absolute quantity (non-advanced stores).
+- `POST /product/custom_fields/{store_id}/{product_id}` — **tags**, custom fields, similar products, release date. See "Product tags" below.
+- `POST /product/status_metadata/{store_id}/{product_id}` — `status`, `seo_title`, `seo_description`, `seo_image`, `desc_page` only. No `tags`, no `release_date`.
+
+### Product tags
+
+Model: `tags: {type: [String], default: []}` (`core/models/product.ts:158`). Exact, case-sensitive tokens; Blanxer treats several of them as behaviour flags.
+
+**Write paths — only two:**
+
+1. **Create** — `POST /product/{store_id}` with `tags: [...]` in the body. `add-product.ts` destructures only `name, store_id, brand, variants, quantity` and spreads `...rest` into the new Product, so `tags` lands verbatim.
+2. **Edit** — `POST /product/custom_fields/{store_id}/{product_id}`, owner/manager (`authRoleCheck('owner','manager')`).
+
+```json
+{
+  "tags": ["seller:acme", "coming_soon"],
+  "custom_fields": [],
+  "similar_products": [],
+  "release_date": "2026-09-01T00:00:00.000Z"
+}
+```
+
+**⚠ Full-replace semantics.** Schema (`edit-product-custom-fields.ts:14-17`):
+
+```
+similar_products: z.string().array().default([]),
+tags:             z.string().array().default([]),
+custom_fields:    z.any().array().default([]),
+release_date:     z.string().optional()
+```
+
+All three arrays default to `[]`, and the handler does a flat `updateOne({custom_fields, tags, search_key, similar_products, release_date: release_date ?? undefined})`. Posting `{"tags": [...]}` alone therefore **wipes `custom_fields` and `similar_products`**. Read the product first and echo all three back. `release_date` is the only safe omission (`?? undefined` → mongoose skips it).
+
+Side effects of the handler: recomputes `search_key` via `generateProductSearchKey`, and calls `cacheHandler.clearCache(store_id)`.
+
+**Colon exclusion from search.** `generateProductSearchKey` (`product/task/utils.ts:25-26`):
+
+```
+const tags = priorityPayload?.tags || product?.tags || [];
+const filteredTags = tags?.filter((el: string) => !el.includes(':'));
+```
+
+Any tag containing `:` is dropped before `search_key` is assembled. `key:value` and `seller:<name>` tags are facets, deliberately invisible to text search.
+
+**Tag vocabulary** (dashboard tag-docs modal, `BlanxerDashboard/src/features/add_product/ui/AddCustomField.tsx` → `tagGroups`):
+
+| Tag | Effect |
+|---|---|
+| `coming_soon` | "Coming Soon" label, Add-to-Cart disabled on grid + detail. |
+| `no_price` | Hides price, compare price, discount badges. |
+| `show_color_chips` | Colour chip dots on cards (needs hex colour variants + "Show color preview"). Read in `site_builder/ui/ProductGrid.tsx:55`. |
+| `team_order` | Team/group ordering mode on the detail page. |
+| `main` | Sorts first under auto-sort. |
+| `rd_<Label>_<Link>` | Redirect button; `+` = space. `rd_Buy+Now_https://example.com`. |
+| `ard_<Label>_<Link>` | Same, alternate button style. |
+| `<key>:<value>` | Faceted storefront filter grouped by key. |
+| `seller:<name>` | Admin Products page Seller filter; distinct values are scraped from tags (`features/products/index.tsx:191-236`), so spelling must be consistent. |
+| `mirrago_tryon` | Virtual Try-On button; requires the Mirrago plugin. |
+
+**Not available for tags:**
+
+- `POST /product/{store_id}/bulk_add` — fixed column list (`bulk-product-add.ts:77-99`), no `tags`.
+- `POST /product/{store_id}/bulk_edit` — fixed column list (`bulk-product-edit.ts:44-55`: `id, vid, product_name, variant_name, price, crossed_price, weight, sku, exim_code, alt_barcode`), no `tags`. Rows missing any listed column are silently filtered out, and the file is capped at 500 rows.
+- `GET /product/p/public/{store_id}` returns `tags` but is response-cached and filters to `status === 'Active' && channel != 3` — unusable for a full-catalogue tag audit on a POS store.
+
+**Bulk recipe (catalogue-wide tag add/remove):**
+
+1. `GET /product/{store_id}` → ids (+ name/status/channel for filtering).
+2. Per product: `GET /product/{store_id}/{product_id}` → current `tags`, `custom_fields`, `similar_products`.
+3. Compute the new tag set (union / subtract / replace).
+4. Skip the POST when the set is unchanged — avoids needless cache churn.
+5. `POST /product/custom_fields/{store_id}/{product_id}` with all three arrays.
+6. Re-`GET` a sample to verify.
+
+`scripts/manage_tags.py` implements exactly this, dry-run by default.
 
 **Inventory / outlets**
 

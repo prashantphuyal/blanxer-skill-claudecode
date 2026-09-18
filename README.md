@@ -11,6 +11,7 @@ Drop it into `~/.claude/skills/` and it activates whenever you mention Blanxer, 
 - **Products & inventory** — bulk upload from CSV, Excel, or paired handwritten bill images (printed invoice for cost + notebook for selling price); per-outlet stock-in; write-off with all 7 subtypes (`DAMAGED / EXPIRED / LOST / THEFT / COUNT_CORRECTION / PURCHASE_RETURN / SYSTEM_FIX`); transfer between outlets; count corrections; clean product delete with the write-off-first orphan-stock recipe.
 - **Barcode labels** — auto-generated PDF at end of upload (one page per unit on-hand), plus an on-demand reprint script (by product ID or name substring, simple or by-quantity mode).
 - **Image uploads** — multipart with server-side WebP auto-conversion; aspect-ratio aware (fetches `customization.image_ratio` from the store).
+- **Product tags** — the full special-tag vocabulary (`coming_soon`, `no_price`, `main`, `team_order`, `show_color_chips`, `mirrago_tryon`, `rd_`/`ard_` redirect buttons, `key:value` and `seller:<name>` facets); set at upload time from a CSV column or a whole-run env var, or bulk add/remove/replace across the catalogue afterwards — with the read-merge-write that stops the full-replace endpoint from wiping custom fields.
 - **Catalog metadata** — categories (fetch-once cached, never auto-create), suppliers (search/create with the honest "supplier_ref is free-text only, not linked to stock-in" caveat).
 - **Orders** — admin/POS/lead create with custom line items, edit-items, status/payment updates, bulk status (with Group1/Group2 rule), delete guards.
 - **Transactions & payments** — list, settlement history, subscription lookup, plus the "no date-filter on transaction list" limitation baked in.
@@ -44,7 +45,7 @@ To verify it loaded, ask Claude "list my available skills" — you should see `b
 
 ## Usage
 
-The skill exposes two turnkey scripts under `scripts/`. Both take the API key via env var so it stays out of shell history and disk.
+The skill exposes three turnkey scripts under `scripts/`. All take the API key via env var so it stays out of shell history and disk.
 
 ### Bulk product upload + auto-generate barcode PDF
 
@@ -55,20 +56,49 @@ BLANXER_CSV='./products.csv' \
 python3 ~/.claude/skills/blanxer-skill/scripts/upload_direct_http.py
 ```
 
-CSV format:
+CSV format (the `tags` column is optional):
 
 ```csv
-product_name,qty,cost_rate,selling_rate
-"1. sall set",45,1460,2400
-"2. sall set",20,2236,3800
+product_name,qty,cost_rate,selling_rate,tags
+"1. sall set",45,1460,2400,"seller:acme;color:red"
+"2. sall set",20,2236,3800,coming_soon
 ```
+
+Row tags are semicolon- or pipe-separated — not comma, so plain CSV stays safe.
 
 Optional env vars:
 - `BLANXER_CHANNEL` (default `3` = POS; `1` = All, `2` = Website)
 - `BLANXER_DELAY_S` (default `3.0` seconds between products)
+- `BLANXER_TAGS` (comma-separated tags applied to every product in the run, e.g. `'seller:acme,brand:nike'`)
 - `BLANXER_BARCODE_PDF` (default `<CSV dir>/barcodes.pdf`; set to `""` to skip PDF generation)
 
 After the loop, the script emits a barcode PDF (one page per unit of live stock, product name on top, no store name — see label defaults below).
+
+### Manage product tags in bulk
+
+Tags carry real behaviour in Blanxer — `coming_soon`, `no_price`, `main`, `team_order`, `show_color_chips`, `mirrago_tryon`, the `rd_`/`ard_` redirect buttons, and the `key:value` / `seller:<name>` filter facets. `manage_tags.py` edits them across the catalogue:
+
+```bash
+# See what's tagged today
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/manage_tags.py list
+
+# Dry run: what would change
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/manage_tags.py \
+  add "seller:acme" --all
+
+# Commit it
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/manage_tags.py \
+  add "seller:acme" --all --apply
+
+# Narrower selectors
+... manage_tags.py add "coming_soon" --name-contains "diwali" --apply
+... manage_tags.py remove "coming_soon" --has-tag coming_soon --apply
+... manage_tags.py set "brand:nike,main" --ids 66f...,66f... --apply
+```
+
+Modes: `list`, `add` (union), `remove` (subtract), `set` (replace the array). Selectors `--all`, `--ids`, `--name-contains`, `--has-tag`, `--channel` AND together. Nothing is written without `--apply`; the dry run prints a before → after diff per product.
+
+Why a script rather than one curl: the tag endpoint (`POST /product/custom_fields/{store_id}/{product_id}`) is a **full replace** whose `custom_fields` and `similar_products` both default to `[]`, so a naive tags-only POST erases them. The script reads each product first and echoes all three arrays back.
 
 ### Reprint barcodes on demand
 
@@ -127,7 +157,8 @@ blanxer-skill/
 ├── references/
 │   └── api.md                      # Complete Blanxer API reference (routes, payloads, enums, gotchas)
 └── scripts/
-    ├── upload_direct_http.py       # Bulk upload + auto barcode PDF
+    ├── upload_direct_http.py       # Bulk upload (+ tags) + auto barcode PDF
+    ├── manage_tags.py              # Bulk add/remove/replace product tags
     ├── reprint_barcodes.py         # On-demand label reprint
     └── upload_loop.js              # Legacy browser-tab injection (deprecated, kept for reference)
 ```
