@@ -387,24 +387,23 @@ When supplier context exists:
 3. **Create only on explicit confirmation**: `POST /pos-finance/suppliers/{store_id}` with at least `name` (**owner/manager only** — non-owner/manager users must pick existing or skip). Never auto-create; a typo would spawn a duplicate vendor. Capture the returned `_id`.
 4. **Never block the upload on supplier.** If the user declines, is unsure, or lacks the role to create, proceed with no supplier — stock-in still works fine.
 
-**⚠ How the chosen supplier is actually applied — read this carefully.**
+**⚠ How the chosen supplier is actually applied.**
 
-**`POST /inventory/stock-in` does NOT accept a supplier id.** The `Batch` model has a `supplier` field but the handler never sets it — it only writes `supplier_ref: <reference_number>` (free text) to the batch. So:
+**`POST /inventory/stock-in` and `/inventory/bulk-stock-in` accept a `supplier` id** (top-level, optional, one supplier per stock-in run — "one run is one delivery from one supplier"). It's written to `Batch.supplier`, a real ObjectId ref, which `GET /inventory/batch/{store_id}?supplier=<id>` filters on and populates with the supplier's name.
 
-- Selecting a supplier does not create an automatic stock↔supplier link.
-- The only supplier trace on the batch is whatever string you send in `stock-in.reference_number`.
-- Payables / ledger entries are a separate flow (`POST /pos-finance/supplier-entry`) — not triggered by stock-in.
+```json
+{ "store_id": "...", "outlet_id": "...", "supplier": "<supplier _id>", "reference_number": "INV-4471", "items": [...] }
+```
 
-**Practical application** (all this step does):
-
-- Pass a stable descriptor into every `stock-in` call for this upload: `reference_number: "ABC Traders / INV-4471"` (name + invoice number if the user has one). This becomes the batch's `supplier_ref` and is searchable in stock movement logs.
-- If the user *also* wants the batch value recorded as payable to that supplier, offer — don't assume — a follow-up `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}` after the upload completes. Ask before firing.
+- **Pass `supplier` — not `supplier_ref`.** `supplier_ref` is not a field on the `Batch` model, so mongoose has always dropped it silently. Any older recipe that stuffed the supplier name into `reference_number` was only ever writing free text.
+- `reference_number` is still worth sending for the **invoice/bill number** (max 320 chars). It lands on the stock-movement log and is searchable there.
+- **Linking the batch is not a payable.** Stock-in writes no supplier ledger entry. If the user wants the stock recorded as money owed, that's a separate `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}` — offer it, don't assume it. (Full supplier ledger surface is the sibling `blanxer-supplier` skill.)
 
 **Be honest with the user**: "Picking a supplier just puts their name in the batch reference and (optionally) records a payable. It doesn't magic-link the vendor to each stocked-in item — Blanxer's batch model doesn't wire that up today."
 
 ### 4. Run the upload loop (direct HTTP via API key)
 
-Fire `scripts/upload_direct_http.py` with `BLANXER_API_KEY`, `BLANXER_OUTLET_ID`, `BLANXER_CSV`, and optional channel/delay overrides. It handles the `sk_ → JWT` exchange, sets the Cloudflare browser headers, loops create + stock-in per row with a configurable delay, and auto-generates the barcode PDF at the end.
+Fire `scripts/upload_direct_http.py` with `BLANXER_API_KEY`, `BLANXER_OUTLET_ID`, `BLANXER_CSV`, and optional channel/delay/tag/supplier overrides (`BLANXER_SUPPLIER` attaches the supplier to every batch the run creates, `BLANXER_REFERENCE` records the invoice number). It handles the `sk_ → JWT` exchange, sets the Cloudflare browser headers, loops create + stock-in per row with a configurable delay, and auto-generates the barcode PDF at the end.
 
 For each product, include `image_urls: [<url1>, <url2>, ...]` (from step 3.5) in the create-product body. For POS-only uploads, `image_urls: []` is fine.
 
@@ -548,9 +547,11 @@ Response — grab `category._id`:
 
 **Cache tip for large batches**: fetch `GET /store` **once** at the start and keep `.categories[]` in memory for the entire pass. Every category create appends to that in-memory list too so subsequent lookups reuse the id instead of hitting the network. 74 products doing 74 separate `GET /store` calls is 74 wasted round trips.
 
-### Product-edit endpoints (4 handlers, not one)
+### Product-edit endpoints (4 single-product handlers, not one)
 
-There's **no single "update product"** route. Editing an existing product is split across four handlers in `product.routes.ts:105-124`. Send the payload to the one that matches what you're changing — sending fields to the wrong handler is silently ignored.
+**Editing more than a couple of products? Skip this section and use `POST /product/{store_id}/bulk_update`** (see "Bulk endpoints" below) — it patches up to 500 products in one call, writes only the fields you name, and can't wipe anything by omission. These four handlers are for a single product, or for the few fields `bulk_update` deliberately refuses (quantity, slug, image lists, variant create/delete).
+
+There's **no single "update product"** route. Editing one existing product is split across four handlers in `product.routes.ts`. Send the payload to the one that matches what you're changing — sending fields to the wrong handler is silently ignored.
 
 **1. `POST /product/general/{store_id}/{product_id}`** — general info + top-level images. (`edit-product-general-information.ts`, auth: owner/manager)
 
@@ -663,6 +664,75 @@ If the order is reversed (delete first, then write-off), write-off still succeed
 - **No paid plan** (`store.plan` empty/undefined) → hard cap of **15 products total**, no `bulk_add`, no SMS, no Excel export.
 - **Any of the 5 paid plans** (`pos`, `basic`, `premium`, `platinum`, `plus`) → unlimited products, `bulk_add` allowed, SMS/export unlocked.
 
+### Bulk endpoints — use these instead of looping (added 2026-09/10)
+
+The backend grew a set of routes built specifically for agents that would otherwise loop single-record endpoints. **Reach for these first whenever a change touches more than a handful of records.** Backend's own reference: `docs/BULK_ENDPOINTS.md` in `gigbig_backend`.
+
+**⚠ One rate limit governs all of them: 30 requests per minute per store**, a single bucket shared across every bulk route below (`core/middlewares/bulkGuard.ts`). Over it you get `429 {"message": "Too many bulk requests for this store. Please wait a minute and try again."}` plus `RateLimit-*` headers. That budget is per store, not per IP, so a second agent working the same store draws from the same 30. Space bulk calls ~2s apart and you'll never see it.
+
+**JSON bodies are capped at 1 MB**, which bites before the item cap does: 500 products × a 2 KB description is already over. Chunk to 50–100 items when sending long copy, 500 otherwise.
+
+#### `POST /product/{store_id}/bulk_update` — field-level edits, 1–500 products
+
+The one to know. **A true partial patch**: only keys present in `set` are written, nothing is defaulted, so an omitted field is never zeroed — the opposite of the single-product `custom_fields` and `variant_inventory` handlers. Owner/manager.
+
+```json
+{
+  "updates": [
+    {
+      "product_id": "<24-hex>",
+      "set": {
+        "name": "…", "channel": 1, "status": "Active",
+        "categories": ["<cat id>"], "add_categories": [], "remove_categories": [],
+        "brand": "<brand id>", "tags": ["seller:acme"],
+        "price": 0, "compare_at_price": 0, "cost_per_item": 0, "weight": 0,
+        "sku": "…", "continue_selling": true,
+        "seo_title": "", "seo_description": "", "seo_image": "https://…",
+        "description": "<p>HTML</p>", "long_description": "<p>HTML</p>"
+      },
+      "variants": [
+        { "variant_id": "<24-hex>", "set": { "price": 0, "compare_at_price": 0, "cost_per_item": 0, "sku": "", "weight": 0, "alt_barcode": "" } }
+      ]
+    }
+  ]
+}
+```
+
+Response: `{success, requested, updated, results: [{product_id, ok, error?}]}` — `updated` counts products actually modified, so resending identical values returns `ok: true` with `updated: 0`. Validation is per item: a bad item is reported in `results` and the rest still write.
+
+Rules worth knowing before you build a payload:
+
+- **Quantity is not editable here** (`quantity` fails the item as an unsupported field). Stock moves through stock-in / write-off / adjust-batch, or `/variant_inventory` on simple-inventory stores.
+- **`slug` is not editable here either** — it's the product URL, and a bulk slug change would break every indexed link at once.
+- A product may appear **once per request**; two items for the same product race inside one `bulkWrite`. Merge the edits.
+- Category ids must already exist in `store.categories`; brand must belong to the store.
+- **SKU uniqueness is store-wide**, and a SKU currently held by another product is refused *even if that product gives it up in the same request* — swap SKUs across two calls.
+- `search_key` is rebuilt when name, categories or tags change. Description and SEO fields never feed it.
+- `description` / `long_description` are stored as sent — raw HTML, no sanitising.
+
+Cost is flat regardless of batch size: 1 store read, 1 product read, ≤1 brand read, ≤1 SKU read, 1 `bulkWrite`, 1 cache clear. That's why it beats the loop by a wide margin.
+
+#### The rest of the bulk surface
+
+| Route | Cap | Roles | Notes |
+|---|---|---|---|
+| `POST /product/{store_id}/bulk_status` | 2000 ids | owner, manager | `{product_ids: [...], status: "Active"\|"Draft"\|"Archived"}`. Malformed ids are dropped, not fatal. Returns `{success, updated}`. |
+| `POST /product/{store_id}/bulk_delete` | — | owner, manager | Still does **not** cascade inventory — write off stock first (see the delete recipe above). |
+| `POST /product/{store_id}/bulk_add` (CSV) | 3000 rows | owner, manager + premium **or POS** plan | Barcode range reserved atomically; rows whose SKU already exists or repeats in the file come back in `rejected` with `reject_reason`. |
+| `POST /product/{store_id}/bulk_edit` (CSV) | **3000 rows** (was 500) | owner, manager | Multipart, so the 1 MB JSON cap doesn't apply. |
+| `POST /store/{store_id}/categories/bulk_seo` | 500 | owner, manager | SEO fields only; any other key fails that item. |
+| `POST /customers/bulk_create/{store_id}` | 1000 | any store role | Existing phones are **skipped, never overwritten**; reasons come back in `skipped[]`. |
+| `POST /order/{store_id}/bulk_label` | 500 ids | owner, manager, csr | `{order_ids, labels, mode: "set"\|"add"\|"remove"}`. `set`/`add` keep only names defined in `store.order_labels`; the rest return in `ignored_labels`. |
+| `POST /order/{store_id}/bulk_status` | — | owner, manager, csr | Group1/Group2 rule still applies (see Orders). |
+| `POST /order/{store_id}/delete_bulk` | — | owner, manager | Now backs the full order docs up to S3 **before** deleting, and deletes nothing if that upload fails. |
+| `POST /inventory/bulk-stock-in` | 1000 items | any role + `stock_in` | Store id in the **body**, not the URL. |
+
+**`x-store-id` must match the store in the URL** (or, for inventory, the body) on every bulk route — a mismatch is refused with `400 You are not allowed to perform this action`.
+
+#### `GET /product/{store_id}/seo_audit` — find what to fix before you bulk-fix it
+
+Any store role, no query params. One pass over the catalogue returning per product: `seo_title`, `seo_description`, `seo_image`, `description_text_length` / `long_description_text_length` (visible text — tags stripped, entities counted as one char), `image_count`, `first_image`, `has_desc_page`, `variant_count`, plus status/channel/price. The description HTML itself is measured but never returned, so the response stays small. Feed the gaps straight into `bulk_update` (products) and `categories/bulk_seo` (categories).
+
 ### Product tags (special/custom tags)
 
 Tags are a plain `[String]` array on the product (`product.ts` → `tags: {type: [String], default: []}`). Blanxer overloads them as **feature flags and filter facets** — a tag is not decorative, it changes storefront and admin behaviour. Treat the tag string as an exact, case-sensitive token.
@@ -705,7 +775,9 @@ Ask the user which tags they want before the run; don't invent them. If they nam
 
 #### Editing tags on existing products (one, some, or all)
 
-Use `scripts/manage_tags.py` — it does the read-merge-write safely, so custom fields and similar products survive:
+**Preferred path: `POST /product/{store_id}/bulk_update` with `set.tags`.** It writes only the fields you name, so it cannot wipe `custom_fields` or `similar_products` the way the single-product route does, and it handles up to 500 products per call. `set.tags` **replaces** the array, so to add or remove a tag you still have to read the current tags first — but the write is one request, not N.
+
+Use `scripts/manage_tags.py`, which does exactly that (read the current tags, compute the new set, write via `bulk_update` in chunks):
 
 ```bash
 BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py add "seller:acme"
@@ -717,11 +789,13 @@ BLANXER_API_KEY=sk_… python3 scripts/manage_tags.py list
 
 Modes: `add` (union, preserves existing), `remove` (subtract), `set` (replace the whole tag array — destructive, requires an explicit selector), `list` (dry inventory of which tag sits on which product). Selectors: `--all`, `--ids a,b,c`, `--name-contains <substr>`, `--has-tag <tag>`, `--channel <1|2|3>`. The script **dry-runs by default** and prints the per-product before → after diff; pass `--apply` to write. Always show the user the dry run first when the selector touches more than a handful of products.
 
-**Why a script and not a loop of one-liners:** the admin list `GET /product/{store_id}` does **not** return `tags` or `custom_fields` (see `product_list_fields` in `product.service.ts:16`) — it only gives you ids. Every tag edit therefore needs a per-product `GET /product/{store_id}/{product_id}` to read the current `tags` + `custom_fields` + `similar_products` before the POST. The script does that N+1 walk with a delay; hand-rolling it is where the custom-fields wipe happens.
+**Why a script and not a one-liner:** the admin list `GET /product/{store_id}` does **not** return `tags` (see `product_list_fields` in `product.service.ts:16`) — it only gives you ids. Reading the current tag set therefore needs a per-product `GET /product/{store_id}/{product_id}`. The script does that read walk, then batches every change into `bulk_update` calls of 500.
+
+**If you fall back to the single-product route** `POST /product/custom_fields/{store_id}/{product_id}`, remember it is a full replace: echo `custom_fields` and `similar_products` back or they're wiped. `bulk_update` has no such trap.
 
 **Don't use the public list for this.** `GET /product/p/public/{store_id}` does return `tags`, but it's response-cached and filters out inactive and POS-channel (`channel: 3`) products — so it will silently miss most of a POS store's catalogue. Enumerate with the authed `GET /product/{store_id}`.
 
-**Neither CSV bulk path handles tags.** `bulk_add` and `bulk_edit` both validate against a fixed column list (`bulk-product-add.ts:77`, `bulk-product-edit.ts:44`) that has no `tags` column, and rows missing any required column are dropped silently. Tagging is per-product JSON only.
+**Neither CSV bulk path handles tags.** `bulk_add` and `bulk_edit` both validate against a fixed column list (`bulk-product-add.ts`, `bulk-product-edit.ts`) that has no `tags` column, and rows missing any required column are dropped silently. Tags go through the create body, `bulk_update`, or the single-product `custom_fields` route.
 
 ### 0. Preflight — read the store plan (verified live 2026-07-20)
 
@@ -820,9 +894,13 @@ is_premium = plan in {"pos", "basic", "premium", "platinum", "plus"}
 When the source (notebook, count) says an already-uploaded product's quantity should change, DON'T re-create the product. Adjust the batch ledger instead:
 
 - **Decrease** (e.g. notebook says "-1"): fetch `batch_id` via `GET /inventory/batch/{store_id}?product={id}&outlet={outlet_id}&hasStock=true`, then `POST /inventory/write-off` with `subtype: "COUNT_CORRECTION"` and `{batch_id, quantity: n}`.
-- **Increase**: another `POST /inventory/stock-in` — creates a new batch layered on top.
-- **Move between outlets**: `POST /inventory/transfer-stock` with `{target_outlet, batches:[{batch_id, quantity}]}`.
-- **Verify**: `GET /inventory/list/{store_id}?outlet={outlet_id}&product_id={id}` — check `current_stock`.
+- **Increase — a miscount on a batch you already have:** `POST /inventory/adjust-batch` with `{store_id, outlet_id, batch_id, quantity, subtype: "COUNT_CORRECTION"}` (or `"SYSTEM_FIX"`). This raises **that** batch's on-hand in place, so a correction no longer spawns a phantom batch at a possibly-wrong cost. This is the right call for "the shelf has 3 more than the system says".
+- **Increase — genuinely new stock arriving:** `POST /inventory/stock-in`, which creates a new batch (correct: new delivery, its own cost price and dates).
+- **Fix a batch's dates or bin** (typo'd expiry, missing mfg date): `POST /inventory/update-batch` with `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}`. `null` clears a field, omitted leaves it. It deliberately **cannot** change quantity or `batch_code` — quantity stays on stock-in/write-off/adjust so the ledger can't diverge, and `batch_code` keeps matching the supplier's paperwork. Writes no ledger row. Worth doing: `expiry_date` drives the expired / expiring-soon cards, the expiring filter, the export, **and sell order**.
+- **Move between outlets**: `POST /inventory/transfer-stock` with `{target_outlet, batches:[{batch_id, quantity}]}`. Note it **copies** `bin_location` and the dates onto the destination batch, so fixing them at the source afterwards does not update the copy.
+- **Verify**: `GET /inventory/list/{store_id}?outlet={outlet_id}&product_id={id}` — check `current_stock`. For the full picture on one product (stock by outlet, in/out flow, sales at true batch cost, batch age and expiry, cost by supplier, recent movements) use `GET /inventory/product/{store_id}/{product_id}?days=90`.
+
+**Sell order is FEFO, not FIFO.** `handle-inventory-reduction.ts` sorts candidate batches by `expiry_date` first and `created_at` only as the tie-break, so the batch that expires soonest is consumed first; batches with no expiry date sort after those, oldest first (which degrades to plain FIFO when nothing has an expiry). This means a wrong `expiry_date` doesn't just skew a dashboard card — it changes which stock gets sold. (Some older comments in the repo still say FIFO; the allocation code is the one that counts.)
 
 Full endpoint bodies, subtypes (`DAMAGED|EXPIRED|LOST|THEFT|COUNT_CORRECTION|PURCHASE_RETURN|SYSTEM_FIX`), and the "adjust to target quantity" recipe are in `references/api.md` under "Inventory adjustment".
 
@@ -897,6 +975,6 @@ Optional env vars: `BLANXER_CHANNEL` (default 3=POS), `BLANXER_DELAY_S` (default
 ## Reference
 
 - `scripts/upload_direct_http.py` — turnkey direct-HTTP uploader (sk_ key → exchange → CF headers → create + stock-in loop). Use this for API-key uploads.
-- `scripts/manage_tags.py` — add / remove / replace product tags in bulk. Reads each product first so `custom_fields` and `similar_products` survive the full-replace endpoint. Dry-runs by default.
+- `scripts/manage_tags.py` — add / remove / replace product tags in bulk. Reads current tags per product, then writes through `bulk_update` in chunks of 500. Dry-runs by default.
 - `scripts/upload_loop.js` — parameterized loop you paste into the tab (browser path).
 - `references/api.md` — captured request/response examples + full endpoint reference table.

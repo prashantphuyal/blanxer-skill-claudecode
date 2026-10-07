@@ -5,20 +5,25 @@ Blanxer product-tag manager — add / remove / replace tags across a catalogue.
 Tags are the only place Blanxer stores per-product feature flags (coming_soon,
 no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirect
 buttons) and filter facets (key:value, seller:<name>). They can be set in the
-create-product body, but changing them afterwards goes through exactly one
-endpoint:
+create-product body; afterwards there are two write paths:
 
+    POST /product/{store_id}/bulk_update              <- what this script uses
     POST /product/custom_fields/{store_id}/{product_id}
 
-That endpoint is a FULL REPLACE, not a patch. Its zod schema defaults
-`tags`, `custom_fields` and `similar_products` all to [], so posting just
-{"tags": [...]} silently wipes the product's custom fields and similar-product
-links. This script always reads the product first and echoes all three arrays
-back, which is the whole reason it exists.
+bulk_update patches up to 500 products per call and writes ONLY the fields
+named in `set`, so it cannot wipe custom_fields or similar_products. The
+single-product custom_fields route is a FULL REPLACE whose `tags`,
+`custom_fields` and `similar_products` all default to [] — posting just
+{"tags": [...]} there destroys the other two. Pass --legacy-writes to use it
+anyway (one product per call, with the three arrays echoed back).
 
-It is also an N+1 walk by necessity: the admin list `GET /product/{store_id}`
-projects a fixed field set that excludes `tags` and `custom_fields`, so current
-tags can only be read per product.
+Reading is still per product: the admin list `GET /product/{store_id}` projects
+a fixed field set that excludes `tags`, so the current tag set of each product
+has to come from `GET /product/{store_id}/{product_id}`. So: N reads, then
+ceil(N/500) writes.
+
+Bulk routes share one budget of 30 requests per minute per store across every
+bulk endpoint, so the writes are paced (--delay, default 2s between chunks).
 
 Usage:
   manage_tags.py list                          [selector]
@@ -35,9 +40,13 @@ add/remove/set refuse to touch the whole catalogue unless you pass --all.
   --channel <1|2|3>           1=All, 2=Website, 3=POS
 
 Flags:
-  --apply        actually write. Without it the script dry-runs and prints
-                 the before -> after diff for every product it would touch.
-  --delay <s>    seconds between write calls (default 0.4)
+  --apply          actually write. Without it the script dry-runs and prints
+                   the before -> after diff for every product it would touch.
+  --delay <s>      seconds between write calls (default 2.0; bulk routes allow
+                   30/min per store, shared with every other bulk caller)
+  --chunk <n>      products per bulk_update call (default 500, the server cap)
+  --legacy-writes  write one product at a time via the custom_fields route
+                   instead of bulk_update (older backends)
 
 Environment:
   BLANXER_API_KEY   sk_… key (59 chars). Required.
@@ -177,9 +186,10 @@ def new_tag_set(mode, current, subject):
     return list(subject)  # set
 
 
-def write_tags(token, store_id, doc, tags):
-    """Full-replace POST — custom_fields and similar_products MUST be echoed
-    back or the handler's `.default([])` wipes them."""
+def write_tags_legacy(token, store_id, doc, tags):
+    """One product via the full-replace route — custom_fields and
+    similar_products MUST be echoed back or the handler's `.default([])`
+    wipes them."""
     body = {
         "tags": tags,
         "custom_fields": doc.get("custom_fields") or [],
@@ -188,6 +198,21 @@ def write_tags(token, store_id, doc, tags):
     if doc.get("release_date"):
         body["release_date"] = doc["release_date"]
     return request("POST", f"{BASE}/product/custom_fields/{store_id}/{doc['_id']}", token, body)
+
+
+def write_tags_bulk(token, store_id, chunk):
+    """One bulk_update call for up to 500 products. `set` carries tags only,
+    so nothing else on the product is touched — no echo-back needed.
+
+    chunk: [(doc, target_tags), ...]
+    Returns (status, response).
+    """
+    body = {
+        "updates": [
+            {"product_id": doc["_id"], "set": {"tags": tags}} for doc, tags in chunk
+        ]
+    }
+    return request("POST", f"{BASE}/product/{store_id}/bulk_update", token, body)
 
 
 def main():
@@ -200,7 +225,10 @@ def main():
     ap.add_argument("--has-tag", default="")
     ap.add_argument("--channel", type=int, choices=[1, 2, 3])
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--delay", type=float, default=0.4)
+    # Bulk routes share 30 req/min per store across every bulk endpoint.
+    ap.add_argument("--delay", type=float, default=2.0)
+    ap.add_argument("--chunk", type=int, default=500)
+    ap.add_argument("--legacy-writes", action="store_true")
     args = ap.parse_args()
 
     api_key = os.environ.get("BLANXER_API_KEY") or sys.exit("BLANXER_API_KEY required")
@@ -265,21 +293,63 @@ def main():
         print("\nNothing to write.")
         return 0
 
-    print(f"\nWriting {len(changed)} product(s)…", flush=True)
     ok = 0
-    for i, (doc, _current, target) in enumerate(changed, 1):
-        code, resp = write_tags(token, store_id, doc, target)
-        if code == 200 and resp.get("success"):
-            ok += 1
-            print(f"[{i:3d}/{len(changed)}] OK   {doc.get('name')}", flush=True)
-        else:
-            failed.append((doc.get("name"), f"write failed: {code} {resp}"))
-            print(f"[{i:3d}/{len(changed)}] FAIL {doc.get('name')}  {code} {resp}", flush=True)
-        if i < len(changed):
-            time.sleep(args.delay)
+    write_failed: list = []  # read failures already printed above
+    if args.legacy_writes:
+        print(f"\nWriting {len(changed)} product(s), one call each (legacy route)…", flush=True)
+        for i, (doc, _current, target) in enumerate(changed, 1):
+            code, resp = write_tags_legacy(token, store_id, doc, target)
+            if code == 200 and resp.get("success"):
+                ok += 1
+                print(f"[{i:3d}/{len(changed)}] OK   {doc.get('name')}", flush=True)
+            else:
+                write_failed.append((doc.get("name"), f"write failed: {code} {resp}"))
+                print(f"[{i:3d}/{len(changed)}] FAIL {doc.get('name')}  {code} {resp}", flush=True)
+            if i < len(changed):
+                time.sleep(args.delay)
+    else:
+        size = max(1, min(args.chunk, 500))
+        chunks = [
+            [(doc, target) for doc, _current, target in changed[i : i + size]]
+            for i in range(0, len(changed), size)
+        ]
+        print(
+            f"\nWriting {len(changed)} product(s) in {len(chunks)} bulk_update call(s)…",
+            flush=True,
+        )
+        for n, chunk in enumerate(chunks, 1):
+            code, resp = write_tags_bulk(token, store_id, chunk)
+            if code == 429:
+                # Shared 30/min bulk budget for the whole store. Wait it out once.
+                print(f"[{n}/{len(chunks)}] rate-limited; waiting 60s", flush=True)
+                time.sleep(60)
+                code, resp = write_tags_bulk(token, store_id, chunk)
+            if code != 200 or not resp.get("success"):
+                for doc, _t in chunk:
+                    write_failed.append((doc.get("name"), f"write failed: {code} {resp}"))
+                print(f"[{n}/{len(chunks)}] FAIL {len(chunk)} product(s)  {code} {resp}", flush=True)
+            else:
+                # Per-item results: an item can fail while the call succeeds.
+                by_id = {doc["_id"]: doc for doc, _t in chunk}
+                for r in resp.get("results") or []:
+                    doc = by_id.get(r.get("product_id"), {})
+                    if r.get("ok"):
+                        ok += 1
+                    else:
+                        write_failed.append((doc.get("name"), r.get("error") or "rejected"))
+                print(
+                    f"[{n}/{len(chunks)}] {len(chunk)} sent, "
+                    f"{resp.get('updated')} modified"
+                    + (f", {len([r for r in resp.get('results') or [] if not r.get('ok')])} rejected" if any(not r.get("ok") for r in resp.get("results") or []) else ""),
+                    flush=True,
+                )
+            if n < len(chunks):
+                time.sleep(args.delay)
 
-    print(f"\n=== TAGS DONE: {ok} written, {len(changed) - ok} failed, {unchanged} skipped as already correct ===")
-    return 0 if ok == len(changed) and not failed else 1
+    for name, err in write_failed:
+        print(f"  FAILED {name}: {err}")
+    print(f"\n=== TAGS DONE: {ok} written, {len(changed) - ok} not written, {unchanged} already correct, {len(failed)} unreadable ===")
+    return 0 if ok == len(changed) and not failed and not write_failed else 1
 
 
 if __name__ == "__main__":

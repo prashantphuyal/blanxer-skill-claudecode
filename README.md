@@ -8,12 +8,13 @@ Drop it into `~/.claude/skills/` and it activates whenever you mention Blanxer, 
 
 ## What it covers
 
-- **Products & inventory** — bulk upload from CSV, Excel, or paired handwritten bill images (printed invoice for cost + notebook for selling price); per-outlet stock-in; write-off with all 7 subtypes (`DAMAGED / EXPIRED / LOST / THEFT / COUNT_CORRECTION / PURCHASE_RETURN / SYSTEM_FIX`); transfer between outlets; count corrections; clean product delete with the write-off-first orphan-stock recipe.
+- **Products & inventory** — bulk upload from CSV, Excel, or paired handwritten bill images (printed invoice for cost + notebook for selling price); per-outlet stock-in with supplier linkage; write-off with all 7 subtypes (`DAMAGED / EXPIRED / LOST / THEFT / COUNT_CORRECTION / PURCHASE_RETURN / SYSTEM_FIX`); in-place batch count corrections (`adjust-batch`) and batch date/bin fixes (`update-batch`); transfer between outlets; per-product inventory analytics; clean product delete with the write-off-first orphan-stock recipe.
+- **Bulk operations** — the agent-facing routes added in late 2026: `bulk_update` (field-level patch for up to 500 products, no wipe-by-omission), `bulk_status`, `categories/bulk_seo`, `customers/bulk_create`, `order/bulk_label`, plus the shared 30-requests-per-minute-per-store budget they all draw from.
 - **Barcode labels** — auto-generated PDF at end of upload (one page per unit on-hand), plus an on-demand reprint script (by product ID or name substring, simple or by-quantity mode).
 - **Image uploads** — multipart with server-side WebP auto-conversion; aspect-ratio aware (fetches `customization.image_ratio` from the store).
 - **Product tags** — the full special-tag vocabulary (`coming_soon`, `no_price`, `main`, `team_order`, `show_color_chips`, `mirrago_tryon`, `rd_`/`ard_` redirect buttons, `key:value` and `seller:<name>` facets); set at upload time from a CSV column or a whole-run env var, or bulk add/remove/replace across the catalogue afterwards — with the read-merge-write that stops the full-replace endpoint from wiping custom fields.
 - **Catalog metadata** — categories (fetch-once cached, never auto-create), suppliers (search/create with the honest "supplier_ref is free-text only, not linked to stock-in" caveat).
-- **Orders** — admin/POS/lead create with custom line items, edit-items, status/payment updates, bulk status (with Group1/Group2 rule), delete guards.
+- **Orders** — admin/POS/lead create with custom line items, edit-items, status/payment updates, bulk status (with Group1/Group2 rule), paged order listing with channel/printed filters, returns & exchanges on online orders, delete guards.
 - **Transactions & payments** — list, settlement history, subscription lookup, plus the "no date-filter on transaction list" limitation baked in.
 - **Analytics & reporting** — daily overview, sales-by-{product,location,staff,payment}, inventory-value, expenses-by-category, profit-loss, POS shift reconciliation.
 - **Store config** — plan detection (`pos / basic / premium / platinum / plus` vs free tier), delivery-charge matrix (Platinum-only, 6 weight tiers × per-district).
@@ -70,6 +71,8 @@ Optional env vars:
 - `BLANXER_CHANNEL` (default `3` = POS; `1` = All, `2` = Website)
 - `BLANXER_DELAY_S` (default `3.0` seconds between products)
 - `BLANXER_TAGS` (comma-separated tags applied to every product in the run, e.g. `'seller:acme,brand:nike'`)
+- `BLANXER_SUPPLIER` (supplier `_id` attached to every batch this run creates — one run is one delivery from one supplier)
+- `BLANXER_REFERENCE` (invoice / bill number recorded on each stock-in)
 - `BLANXER_BARCODE_PDF` (default `<CSV dir>/barcodes.pdf`; set to `""` to skip PDF generation)
 
 After the loop, the script emits a barcode PDF (one page per unit of live stock, product name on top, no store name — see label defaults below).
@@ -98,7 +101,7 @@ BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/manage_t
 
 Modes: `list`, `add` (union), `remove` (subtract), `set` (replace the array). Selectors `--all`, `--ids`, `--name-contains`, `--has-tag`, `--channel` AND together. Nothing is written without `--apply`; the dry run prints a before → after diff per product.
 
-Why a script rather than one curl: the tag endpoint (`POST /product/custom_fields/{store_id}/{product_id}`) is a **full replace** whose `custom_fields` and `similar_products` both default to `[]`, so a naive tags-only POST erases them. The script reads each product first and echoes all three arrays back.
+Writes go through `POST /product/{store_id}/bulk_update` in chunks of 500, which patches only the `tags` field and so can't disturb anything else on the product. Reads are still per product (the admin list doesn't project `tags`). Pass `--legacy-writes` to fall back to the one-at-a-time `custom_fields` route — that one is a **full replace** whose `custom_fields` and `similar_products` default to `[]`, so the script echoes all three arrays back when using it.
 
 ### Reprint barcodes on demand
 

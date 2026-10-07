@@ -15,6 +15,9 @@ Environment variables:
   BLANXER_DELAY_S   Seconds between products. Default: 3.
   BLANXER_TAGS      Comma-separated tags applied to EVERY product in the run,
                     e.g. "seller:acme,brand:nike". Optional.
+  BLANXER_SUPPLIER  Supplier _id to attach to every batch this run creates
+                    (one run = one delivery from one supplier). Optional.
+  BLANXER_REFERENCE Invoice / bill number recorded on each stock-in. Optional.
   BLANXER_BARCODE_PDF  Output path for the barcode PDF. Default: <BLANXER_CSV
                        directory>/barcodes.pdf. Set to "" to skip generation.
 
@@ -41,6 +44,11 @@ CSV_PATH = os.environ.get("BLANXER_CSV", "products.csv")
 CHANNEL = int(os.environ.get("BLANXER_CHANNEL", "3"))
 DELAY_S = float(os.environ.get("BLANXER_DELAY_S", "3"))
 GLOBAL_TAGS = [t.strip() for t in os.environ.get("BLANXER_TAGS", "").split(",") if t.strip()]
+SUPPLIER_ID = os.environ.get("BLANXER_SUPPLIER", "").strip()
+REFERENCE = os.environ.get("BLANXER_REFERENCE", "").strip()
+
+if SUPPLIER_ID and len(SUPPLIER_ID) != 24:
+    sys.exit("BLANXER_SUPPLIER must be a 24-char product/supplier _id")
 
 
 def merge_tags(row_value):
@@ -119,17 +127,27 @@ def create_product(name, selling, tags=None):
 
 
 def stock_in(product_id, qty, cost):
-    return post(f"{BASE}/inventory/stock-in", {
-        "store_id": STORE_ID, "outlet_id": OUTLET_ID, "reference_number": "",
+    # `supplier` is the real Batch.supplier ref (filterable, populated by
+    # /inventory/batch). `supplier_ref` is NOT a field on Batch and is dropped
+    # silently, so the supplier name does not belong in reference_number —
+    # that is for the invoice number.
+    body = {
+        "store_id": STORE_ID, "outlet_id": OUTLET_ID,
+        "reference_number": REFERENCE,
         "items": [{"product_id": product_id, "variant_id": "", "quantity": qty,
                    "cost_price": cost, "bin_location": ""}]
-    })
+    }
+    if SUPPLIER_ID:
+        body["supplier"] = SUPPLIER_ID
+    return post(f"{BASE}/inventory/stock-in", body)
 
 
 rows = list(csv.DictReader(open(CSV_PATH)))
 print(f"Uploading {len(rows)} products with {DELAY_S}s delay (~{len(rows) * DELAY_S / 60:.1f} min)", flush=True)
 if GLOBAL_TAGS:
     print(f"Global tags on every product: {GLOBAL_TAGS}", flush=True)
+if SUPPLIER_ID:
+    print(f"Supplier on every batch: {SUPPLIER_ID}" + (f" (ref {REFERENCE})" if REFERENCE else ""), flush=True)
 ok, fail = 0, 0
 uploaded_pids = []  # for the barcode step
 for i, r in enumerate(rows, 1):

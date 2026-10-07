@@ -140,7 +140,11 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 - `GET /store/{store_id}` — fetches store settings; called frequently as a polling heartbeat (this is the request that floods the network log if you're trying to read it raw).
 - `GET /brand/all/{store_id}` — brand list for the brand dropdown.
 
-## Full endpoint reference (2026-07-20 update)
+## Full endpoint reference (2026-07-20; re-verified against `gigbig_backend@origin/dev` 2026-10-07)
+
+> **Read the backend's own `docs/BULK_ENDPOINTS.md`** (in `gigbig_backend`) before any multi-record operation — it is the authoritative spec for `bulk_update`, `bulk_status`, `categories/bulk_seo`, `customers/bulk_create` and `order/bulk_label`, and it is kept current by the backend team.
+>
+> Re-verified 2026-10-07 and changed since the July capture: `supplier` is now a real field on stock-in; `bulk_update` / `bulk_status` / `seo_audit` / barcode lookup exist on products; `adjust-batch`, `update-batch`, per-product inventory, `pos-list` and batch export exist on inventory; the orders list takes `page`; online orders have returns & exchanges; sell allocation is FEFO; `bulk_edit` takes 3000 rows; `bulk_add` is premium-**or-POS**.
 
 **Auth exchange**
 
@@ -150,10 +154,15 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 
 - `POST /product/{store_id}` — create. Required body: `name`, `description`, `continue_selling`. Owner/manager roles.
 - `DELETE /product/{store_id}/{product_id}` — delete. Owner/manager. Returns `{success: true}`. Only this exact path shape works.
-- `POST /product/{store_id}/bulk_add` — multipart file upload for bulk product creation (alternative to the loop).
+- `POST /product/{store_id}/bulk_add` — multipart file upload for bulk product creation (alternative to the loop). Gate is now `checkPremiumOrPos()`: any paid web plan **or** a `pos` store.
 - `GET /product/pos/{store_id}` — POS product listing.
 - `GET /product/{store_id}` — authed admin list, every product regardless of status/channel. **Projection excludes `tags` and `custom_fields`** (`product_list_fields`, `product.service.ts:16`) — ids only for a tag walk.
 - `GET /product/{store_id}/{product_id}` — full product doc (`toJSON()` minus `__v`), flat, not wrapped in `{success}`. The read half of any tag edit.
+- `POST /product/{store_id}/bulk_update` — **field-level patch for 1–500 products in one call.** Owner/manager, rate-limited by `bulkGuard`. See "Bulk endpoints" below; prefer it over looping the four single-product handlers.
+- `POST /product/{store_id}/bulk_status` — `{product_ids: [≤2000], status: "Active"|"Draft"|"Archived"}` → `{success, updated}`. Non-24-hex ids are dropped rather than failing the call; the store is part of the filter so a foreign id is a no-op.
+- `GET /product/{store_id}/seo_audit` — one pass over the catalogue with the SEO/content state of every product. Any store role, no params.
+- `GET /product/{store_id}/catalog_export` — catalogue export.
+- `GET /product/public/barcode/{store_id}?code=<barcode>` — public barcode/alt-barcode lookup (POS scan path). Matches the product `barcode`, `alt_barcode`, or a variant barcode.
 - `POST /product/general/{store_id}/{product_id}` — name/description/price/images/categories.
 - `POST /product/variant_inventory/{store_id}/{product_id}` — variants + absolute quantity (non-advanced stores).
 - `POST /product/custom_fields/{store_id}/{product_id}` — **tags**, custom fields, similar products, release date. See "Product tags" below.
@@ -216,8 +225,9 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 
 **Not available for tags:**
 
-- `POST /product/{store_id}/bulk_add` — fixed column list (`bulk-product-add.ts:77-99`), no `tags`.
-- `POST /product/{store_id}/bulk_edit` — fixed column list (`bulk-product-edit.ts:44-55`: `id, vid, product_name, variant_name, price, crossed_price, weight, sku, exim_code, alt_barcode`), no `tags`. Rows missing any listed column are silently filtered out, and the file is capped at 500 rows.
+- `POST /product/{store_id}/bulk_add` — fixed column list (`bulk-product-add.ts`), no `tags`. Capped at 3000 rows.
+- `POST /product/{store_id}/bulk_update` — **does** take `tags` in `set`, and replaces the array. The preferred bulk tag writer.
+- `POST /product/{store_id}/bulk_edit` — fixed column list (`bulk-product-edit.ts`: `id, vid, product_name, variant_name, price, crossed_price, weight, sku, exim_code, alt_barcode`), no `tags`. Rows missing any listed column are silently filtered out. Capped at **3000 rows** (raised from 500).
 - `GET /product/p/public/{store_id}` returns `tags` but is response-cached and filters to `status === 'Active' && channel != 3` — unusable for a full-catalogue tag audit on a POS store.
 
 **Bulk recipe (catalogue-wide tag add/remove):**
@@ -240,13 +250,22 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
   { "name": "Main Branch", "address": "...", "contact_name": "...", "contact_number": "...", "status": "active" }
   ```
   **Never auto-enable** — treat as a manual, Platinum-only owner action. Skill should only detect current mode and branch.
-- `POST /inventory/stock-in` — add stock to an outlet. Body: `{store_id, outlet_id, reference_number, batch_code?, items: [{product_id, variant_id?, quantity, cost_price, expiry_date?, mfg_date?, bin_location?}]}`. Response: `{total_items, total_batches}`.
-- `POST /inventory/bulk-stock-in` — many SKUs, one outlet, one request.
+- `POST /inventory/stock-in` — add stock to an outlet. Body: `{store_id, outlet_id, reference_number?, batch_code?, supplier?, items: [{product_id, variant_id?, quantity, cost_price, expiry_date?, mfg_date?, bin_location?}]}`. Response: `{total_items, total_batches}`. **`supplier`** (optional, top-level — one stock-in is one delivery from one supplier) writes `Batch.supplier`, a real ref that `GET /inventory/batch?supplier=` filters and populates. There is no `supplier_ref` field on `Batch`; anything sent under that name has always been dropped silently. Linking a supplier here does **not** post to their ledger.
+- `POST /inventory/bulk-stock-in` — many SKUs, one outlet, one request (≤1000 items). Also accepts `supplier`. Store id goes in the **body**, not the URL.
 - `POST /inventory/transfer-stock` — move between outlets.
 - `POST /inventory/write-off` — damage / loss.
-- `GET /inventory/list/{store_id}?outlet=<id>` — current on-hand per outlet.
-- `GET /inventory/summary/{store_id}` — summary cards.
-- `GET /inventory/stock-movement-logs/{store_id}` — full movement history.
+- `POST /inventory/adjust-batch` — **raise one existing batch's on-hand in place** (count correction), instead of spawning a new batch. Body `{store_id, outlet_id, batch_id, quantity (≥1), subtype: "COUNT_CORRECTION"|"SYSTEM_FIX", reference_number?}`. Needs the `stock_in` inventory role. Transactional; writes the ledger + movement log. Decreases still go through `/write-off`.
+- `POST /inventory/update-batch` — edit a batch's **descriptive** fields only: `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}`, each `null` to clear, omitted to leave alone. Never quantity (that would let Batch / StockLedger / Product counters diverge) and never `batch_code` (it's the supplier's lot id). Writes no ledger row, needs no transaction. `outlet_id` is both the role scope and a re-check against the batch, so a caller can't edit a batch in an outlet they don't hold.
+- `POST /inventory/update-outlet` — needs `update_outlet` role.
+- `POST /inventory/change-website-outlet` — repoint `store.website_outlet`; needs `update_outlet`.
+- `GET /inventory/list/{store_id}?outlet=<id>` — current on-hand per outlet. Shows every product ever stocked at the outlet, **zero-stock rows included**. Filters: `page`, `per_page` (≤100), `product_id`, `variant_id`, `category`, `q` (product name or SKU, product or variant), `movement=dead|fast`, `stock_status=IN_STOCK|LOW_IN_STOCK|OUT_OF_STOCK` (applied to the summed stock after grouping), `sort=recent|stock_asc|stock_desc|value_desc|sold_recent|sold_oldest` (`sold_oldest` puts never-sold stock first).
+- `GET /inventory/summary/{store_id}` — overview cards, built from the same thresholds as the list so the counts always agree. Returns `total_value`, `total_cost`, `total_skus`, `total_qty`, `stock_health{out_of_stock, low_stock, dead_stock, dead_stock_cost}`, `stock_movement{fast_moving, expiring_soon, expired}`, `top_value[]`, `slow_stock[]`, `write_offs{days, items, cost, by_reason[]}`, `value_trend[]`, `thresholds{…}`, `updated_at`.
+- **Shared thresholds** (`features/inventory/constants.ts`) — quote these rather than inventing your own: low stock ≤ **10** units (and > 0), slow/dead = no sale in **90** days (or never sold), fast-moving = sold within **7** days, expiring soon = within **30** days. Timezone for day bucketing is `Asia/Kathmandu`.
+- `GET /inventory/stock-movement-logs/{store_id}` — full movement history. Needs `get_stock_movement`.
+- `GET /inventory/stock-movement-detail/{store_id}/{sm_id}` — one movement's lines.
+- `GET /inventory/pos-list/{store_id}` — POS-only inventory list (drops web-only and non-Active products). Gated by `checkPosPlan`.
+- `GET /inventory/product/{store_id}/{product_id}?outlet=&days=30|90|180|365` — **one product's full inventory picture**: stock by outlet, what came in and went out over the window, sales costed at the true batch each unit came from, batch age and expiry, cost by supplier, and the latest movements. Four parallel reads, cached 10 min in Redis. Only meaningful on advanced-inventory stores, and only back to the day it was enabled (`data_since` in the response).
+- `GET /inventory/export/{store_id}?outlets=&stock=all|in_stock|zero&include_inactive=1` — every batch as Excel. Owner/manager; token may be passed in the query so it can open in a tab.
 
 **Advanced-inventory detection — two conditions, both required**
 
@@ -311,7 +330,7 @@ Read `.plan` from `GET /store/{store_id}`. `isPremiumStore(plan)` returns `true`
 | Capability | Source |
 |---|---|
 | Products capped at 15 total | `add-product.ts:70` |
-| `POST /product/{id}/bulk_add` (multipart bulk upload) | `checkPremium()` |
+| `POST /product/{id}/bulk_add` (multipart bulk upload) | `checkPremiumOrPos()` — a `pos`-tier store now passes too |
 | Product Excel export (`export_all`, `export_edit`) | export tasks |
 | Order Excel export | export-order tasks |
 | SMS feature | `enable-sms.ts:72` |
@@ -500,19 +519,27 @@ POST /pos-finance/suppliers/{store_id}
 - `GET /pos-finance/supplier-ledger/{store_id}/{id}` — full ledger history.
 - `POST /pos-finance/supplier-entry/{store_id}/{id}` — record a payable (purchase on credit) or a payment. This is the endpoint the user hits *if* they want the current stock-in to hit the supplier's payable ledger — it's not automatic.
 
-**⚠ Critical linkage caveat — supplier does NOT attach to stock-in.**
+**Supplier ↔ stock-in linkage (changed — this used to be a "not supported" caveat).**
 
-The `Batch` mongoose schema has a `supplier` ObjectId field, but the `POST /inventory/stock-in` handler **never sets it**. What it does write is `batch.supplier_ref: <reference_number>` — a free-text field derived from the `reference_number` you pass in. So:
+`POST /inventory/stock-in` and `/inventory/bulk-stock-in` both accept a top-level **`supplier`** (optional ObjectId): one stock-in run is one delivery from one supplier. It is written to `Batch.supplier`, a real ref — `GET /inventory/batch/{store_id}?supplier=<id>` filters on it and populates the supplier's name, and the per-product inventory endpoint reports cost by supplier off it.
 
-- Picking or creating a supplier does not create an automatic link to the newly stocked-in batch.
-- The only supplier trace that reaches a batch today is whatever string you send in `stock-in.reference_number`.
-- Supplier accounting (payables, ledger, balance) is a separate POS-finance flow via `supplier-entry` — never triggered as a side-effect of stock-in.
+```json
+{ "store_id": "…", "outlet_id": "…", "supplier": "<supplier _id>",
+  "reference_number": "INV-4471", "items": [ … ] }
+```
 
-**How to actually attach a supplier to inventory** (as much as the API allows):
+Two things that have **not** changed:
 
-1. Search / create supplier as above, capture `_id` and `name`.
-2. In the `stock-in` call, put a stable descriptor into `reference_number`: `"ABC Traders / INV-4471"` (name + invoice number if the user has it). This becomes `batch.supplier_ref` and is searchable in stock movement logs.
-3. If the user explicitly wants the batch value recorded as payable to that supplier, follow up with `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}` — separate action, ask before firing.
+- **`supplier_ref` is not a field on `Batch`.** Mongoose has always dropped it silently, so any recipe that wrote the supplier name into `reference_number` and called it a link was writing free text into a different field. Send `supplier`.
+- **Linking a batch is not accounting.** Stock-in posts nothing to the supplier's ledger. If the user wants the stock recorded as money owed, that is a separate `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}` — ask before firing.
+
+`reference_number` (max 320 chars) is still the right place for the **invoice / bill number**; it reaches the stock-movement log and is searchable there.
+
+**How to attach a supplier to inventory:**
+
+1. Search / create the supplier as above, capture `_id`.
+2. Pass `supplier: "<_id>"` on every `stock-in` call of that delivery, with the bill number in `reference_number`.
+3. Only if the user asks for the payable: `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}`.
 
 ## Inventory adjustment (post-upload corrections)
 
@@ -520,8 +547,10 @@ There is no single "set quantity to X" endpoint — the ledger model uses batche
 
 | Goal | Endpoint | Notes |
 |---|---|---|
-| Increase stock | `POST /inventory/stock-in` | Creates a new batch. Same payload as the initial upload flow. |
+| New stock arriving | `POST /inventory/stock-in` | Creates a new batch at its own cost price. Same payload as the initial upload flow. |
+| Increase an existing batch (miscount) | `POST /inventory/adjust-batch` | `{store_id, outlet_id, batch_id, quantity, subtype: "COUNT_CORRECTION"\|"SYSTEM_FIX", reference_number?}`. Raises **that** batch in place, so a correction no longer invents a batch at a guessed cost. Role: `stock_in`. |
 | Decrease / correct count | `POST /inventory/write-off` (subtype `COUNT_CORRECTION`) | Pulls from specific batches — you need `batch_id`. |
+| Fix a batch's dates or bin | `POST /inventory/update-batch` | `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}` — `null` clears, omitted leaves alone. Never quantity, never `batch_code`. No ledger row. |
 | Move between outlets | `POST /inventory/transfer-stock` | `{store_id, outlet_id, target_outlet, batches:[{batch_id, quantity}]}`. Role: `transfer_stock`. |
 
 ### Discovering `batch_id`
@@ -788,7 +817,12 @@ Streams `application/pdf` with `Content-Disposition: inline; filename="barcodes.
 
 Sibling endpoint `GET /product/generate_barcode/{store_id}/{print_id}` (no `quantities`) prints one label per unit of the product's stored `quantity` — simpler but less precise. For the upload flow, use `_quantity` since you know exactly how many you stocked in (and can subtract for any post-upload write-offs).
 
-**Label option query flags** (from `barcodeSchema`): all boolean — `show_name`, `show_variant`, `show_price`, `show_barcode`, `show_store`, `show_crossed_price`, `show_company_info`, `use_alt_barcode`, `prefix_barcode`, plus style switches `jewelry_tag`, `jewelry_cutout`, `mrp_label`, `mrp_center`.
+**Label option query flags** (from `barcodeSchema`): all boolean — `show_name`, `show_variant`, `show_price`, `show_barcode`, `show_store`, `show_crossed_price`, `crossed_as_mrp`, `show_company_info`, `use_alt_barcode`, `prefix_barcode`, plus style switches `jewelry_tag`, `jewelry_tag_90`, `jewelry_cutout`, `mrp_label`, `mrp_center`.
+
+- `crossed_as_mrp` — print the compare-at price **alone**, labelled MRP, instead of the selling price. Different from `show_crossed_price`, which prints both.
+- `use_alt_barcode` — print the product's own `alt_barcode` instead of the generated one, falling back to the generated one when alt is empty.
+- `prefix_barcode` — prepend `BARCODE_PREFIX` to the generated barcode **at print time only** (never to `alt_barcode`); the stored barcode is unchanged and the prefix is stripped on scan. For scanners that choke on short codes.
+- **Label shape is decided by one winner, in this order:** `mrp_label` → `jewelry_cutout` → `jewelry_tag_90` → `jewelry_tag` → the default label. Each sets its own page size, so passing two only applies the first in that list.
 
 **⚠ Title-line logic on the default 50×25mm label (barcode-utils.ts:143-155)** — the top line of the label is chosen by an `if / else-if`, so `show_store` wins over `show_name`:
 
@@ -1091,10 +1125,56 @@ GET /order/:store_id?from=<ISO>&to=<ISO>&status=<exact>&query=<text>&label=<labe
 
 `query` (full-text search) overrides the date range. Empty `status` excludes `Inactive`.
 
+**Paged mode (added 2026-10, `get-store-orders.ts`).** Send `page` and the handler switches to a paged query; omit it and the response is byte-for-byte the legacy full list, so nothing existing breaks.
+
+```
+GET /order/:store_id?page=1&per_page=30&status=&label=&channel=pos|online&printed=printed|not_printed
+→ { orders: [...], labels: [...], meta: { page, per_page, has_more } }
+```
+
+- `per_page` defaults to 30, max 100. Sorted `created_at: -1, _id: -1`.
+- `channel` and `printed` are **only honoured on the paged path** — they're ignored without `page`.
+  `channel=pos` → `channel == 3`; `channel=online` → `channel != 3`. `printed` tests `printed_at`.
+- `meta.has_more` comes from reading one extra row, not a count — so there is no `total`. Page until `has_more` is false.
+- Use it for anything iterating a busy store: measured on a real store's 90 days, page 1 was 31 KB / 88 ms against 482 KB / 256 ms for the unpaged list.
+
 ```
 GET /order/:store_id/:order_id
 → full order + comments + stock_movements + can_edit_items + integration flags (hasAramex/…)
 ```
+
+### Returns & exchanges (online orders)
+
+POS sales have their own `/pos/sale/:store_id/:id/return`; these three are for orders from the storefront/admin.
+
+```
+GET  /order/:store_id/:order_id/returnable   owner|manager|csr — what is still eligible, per line
+GET  /order/:store_id/:order_id/returns      owner|manager|csr — returns already recorded
+POST /order/:store_id/:order_id/return       owner|manager     — record one
+```
+
+```jsonc
+{
+  "type": "REFUND",                 // REFUND | EXCHANGE
+  "items": [                        // ≥1
+    { "product_id": "…", "variant_id": "…", "product_name": "…",
+      "quantity": 1, "price": 0,
+      "reason": "DAMAGED" }         // 'DAMAGED' skips restock (mirrors POS); anything else is free text
+  ],
+  "exchange_items": [               // EXCHANGE only
+    { "product_id": "…", "variant_id": "…", "quantity": 1, "price": 0, "name": "…" }
+  ],
+  "refund_amount": 0,               // optional override — omit to use the computed value
+  "collect_amount": 0               // optional — what to collect when the replacement costs more
+}
+```
+
+**Money is settled manually**, which is why both amounts are overridable: waive a difference, add a restocking fee, hand back goodwill. A non-`DAMAGED` return restocks through `handle-inventory-return-restock`; loyalty is reversed via `reverseLoyaltyOnCancel`.
+
+### Export
+
+- `GET /order/:store_id/export_order` — owner/manager, one row per order.
+- `GET /order/:store_id/export_order/v2` — one row **per line item**, for orders with several products.
 
 ### Public storefront checkout — `POST /:store_id` (createOrder)
 
