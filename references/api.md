@@ -153,7 +153,7 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 **Products**
 
 - `POST /product/{store_id}` — create. Required body: `name`, `description`, `continue_selling`. Owner/manager roles.
-- `DELETE /product/{store_id}/{product_id}` — delete. Owner/manager. Returns `{success: true}`. Only this exact path shape works.
+- `DELETE /product/{store_id}/{product_id}` — delete. Owner/manager. Returns `{success: true}`. Only this exact path shape works. From 2026-10-18 a product whose batches still hold stock answers **409** `needs_confirmation` `WRITE_OFF_STOCK` and deletes nothing; on the user's yes resend with `?confirm=WRITE_OFF_STOCK` (the stock is written off, then the product goes).
 - `POST /product/{store_id}/bulk_add` — multipart file upload for bulk product creation (alternative to the loop). Gate is now `checkPremiumOrPos()`: any paid web plan **or** a `pos` store.
 - `GET /product/pos/{store_id}` — POS product listing.
 - `GET /product/{store_id}` — authed admin list, every product regardless of status/channel. **Projection excludes `tags` and `custom_fields`** (`product_list_fields`, `product.service.ts:16`) — ids only for a tag walk.
@@ -164,7 +164,7 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 - `GET /product/{store_id}/catalog_export` — catalogue export.
 - `GET /product/public/barcode/{store_id}?code=<barcode>` — public barcode/alt-barcode lookup (POS scan path). Matches the product `barcode`, `alt_barcode`, or a variant barcode.
 - `POST /product/general/{store_id}/{product_id}` — name/description/price/images/categories.
-- `POST /product/variant_inventory/{store_id}/{product_id}` — variants + absolute quantity (non-advanced stores).
+- `POST /product/variant_inventory/{store_id}/{product_id}` — variants + pricing + stock (non-advanced stores). Send the full payload plus `expected_quantity` (root and per variant) = the stock you read. From 2026-10-18: unsent fields are left alone, stock moves by `quantity − expected_quantity`, variants match by `_id`, and dropping a stocked variant answers 409 `REMOVE_STOCKED_VARIANTS` (resend with `confirm: [code]` on the user's yes). See SKILL.md handler #2.
 - `POST /product/custom_fields/{store_id}/{product_id}` — **tags**, custom fields, similar products, release date. See "Product tags" below.
 - `POST /product/status_metadata/{store_id}/{product_id}` — `status`, `seo_title`, `seo_description`, `seo_image`, `desc_page` only. No `tags`, no `release_date`.
 
@@ -245,16 +245,16 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 
 - `GET /inventory/outlets/{store_id}` — list outlets + `allowed` scope + `inventory_roles` + `isOwner`.
 - `POST /inventory/create-outlet` — needs `create_outlet` role.
-- `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum plan only** (`if (!['platinum'].includes(plan)) throw "This feature is only available in Platinum plan"`). **NOT bodyless** — creates the store's first outlet in the same call. **One-way migration**: walks every existing product and seeds `OPENING_BALANCE` batches from current `quantity`/`variants[].quantity` via `executeStockIn(..., skipQuantityIncrease=true)`, then sets `website_outlet` and flips `use_advanced_inventory=true`. Two specific high-volume store IDs are blocked (BETA). Errors if any outlet already exists. Body:
+- `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum or POS plan** (`canUsePos`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
   ```
   { "name": "Main Branch", "address": "...", "contact_name": "...", "contact_number": "...", "status": "active" }
   ```
-  **Never auto-enable** — treat as a manual, Platinum-only owner action. Skill should only detect current mode and branch.
-- `POST /inventory/stock-in` — add stock to an outlet. Body: `{store_id, outlet_id, reference_number?, batch_code?, supplier?, items: [{product_id, variant_id?, quantity, cost_price, expiry_date?, mfg_date?, bin_location?}]}`. Response: `{total_items, total_batches}`. **`supplier`** (optional, top-level — one stock-in is one delivery from one supplier) writes `Batch.supplier`, a real ref that `GET /inventory/batch?supplier=` filters and populates. There is no `supplier_ref` field on `Batch`; anything sent under that name has always been dropped silently. Linking a supplier here does **not** post to their ledger.
-- `POST /inventory/bulk-stock-in` — many SKUs, one outlet, one request (≤1000 items). Also accepts `supplier`. Store id goes in the **body**, not the URL.
-- `POST /inventory/transfer-stock` — move between outlets.
-- `POST /inventory/write-off` — damage / loss.
-- `POST /inventory/adjust-batch` — **raise one existing batch's on-hand in place** (count correction), instead of spawning a new batch. Body `{store_id, outlet_id, batch_id, quantity (≥1), subtype: "COUNT_CORRECTION"|"SYSTEM_FIX", reference_number?}`. Needs the `stock_in` inventory role. Transactional; writes the ledger + movement log. Decreases still go through `/write-off`.
+  **Never auto-enable** — a manual owner action. Skill should only detect current mode and branch.
+- `POST /inventory/stock-in` — add stock to an outlet. Body: `{store_id, outlet_id, reference_number?, batch_code?, supplier?, items: [{product_id, variant_id?, quantity, cost_price, expiry_date?, mfg_date?, bin_location?}]}`. Response: `{total_items, total_batches}`. **`supplier`** (optional, top-level — one stock-in is one delivery from one supplier) writes `Batch.supplier`, a real ref that `GET /inventory/batch?supplier=` filters and populates. There is no `supplier_ref` field on `Batch`; anything sent under that name has always been dropped silently. Linking a supplier here does **not** post to their ledger. From 2026-10-18: optional **`client_request_id`** (the same id again = answered from the first, nothing added: reuse it on a retry); every item must be a product of this store; a product with variants needs one of its `variant_id`s (its only variant is used when it has one, else "Pick a variant for "X" (S, M)"); a product without variants takes none; `quantity` is a whole number.
+- `POST /inventory/bulk-stock-in` — many SKUs, one outlet, one request (≤1000 items). Also accepts `supplier`, and `client_request_id` (each 200-item chunk keyed from it, so a re-sent upload skips chunks that went through). Store id goes in the **body**, not the URL.
+- `POST /inventory/transfer-stock` — move between outlets. Both outlets must belong to the store. Takes `client_request_id`.
+- `POST /inventory/write-off` — damage / loss. Takes `client_request_id`. A write-off of more than a batch holds is refused and nothing in the request moves.
+- `POST /inventory/adjust-batch` — **raise one existing batch's on-hand in place** (count correction), instead of spawning a new batch. Body `{store_id, outlet_id, batch_id, quantity (≥1), subtype: "COUNT_CORRECTION"|"SYSTEM_FIX", reference_number?}`. Needs the `stock_in` inventory role. Transactional; writes the ledger + movement log. Decreases still go through `/write-off`. Takes `client_request_id`.
 - `POST /inventory/update-batch` — edit a batch's **descriptive** fields only: `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}`, each `null` to clear, omitted to leave alone. Never quantity (that would let Batch / StockLedger / Product counters diverge) and never `batch_code` (it's the supplier's lot id). Writes no ledger row, needs no transaction. `outlet_id` is both the role scope and a re-check against the batch, so a caller can't edit a batch in an outlet they don't hold.
 - `POST /inventory/update-outlet` — needs `update_outlet` role.
 - `POST /inventory/change-website-outlet` — repoint `store.website_outlet`; needs `update_outlet`.
@@ -732,7 +732,9 @@ Web vs POS differ only in `channel` (Website `2`, POS `3`, All `1`); everything 
 
 ### Deleting a product cleanly
 
-`DELETE /product/{store_id}/{product_id}` (owner only, `product.service.ts:63`) only removes the Product document. It does **not** cascade to `Batch`, `StockLedger`, or `inventory_summary` — those become orphaned stock, still counted in totals dashboards and outlet on-hand until explicitly written off.
+**Backend from 2026-10-18:** `DELETE` (and `bulk_delete`) answer 409 `WRITE_OFF_STOCK` while stock remains; on the user's yes, `?confirm=WRITE_OFF_STOCK` (or `"confirm": ["WRITE_OFF_STOCK"]` in the bulk body) writes it off and deletes in one go. The manual recipe below works on both backends.
+
+**Older backend:** `DELETE /product/{store_id}/{product_id}` (owner only, `product.service.ts:63`) only removes the Product document. It does **not** cascade to `Batch`, `StockLedger`, or `inventory_summary` — those become orphaned stock, still counted in totals dashboards and outlet on-hand until explicitly written off.
 
 **Correct order: write-off first, then delete.**
 
@@ -1018,6 +1020,8 @@ Auth conventions: `authRoleCheck()` with no args = any authenticated store user;
 → { "status": "success", "_id", "order_number" }
    // or { "status": "halt", ... } if same-phone order exists within 7 days and force=false
 ```
+
+**Variants (2026-10-18):** a line for a product with variants must name one (`variant`). A product with exactly one variant uses it; with several, the call fails with `Pick an option for "X": S, M`: ask the user which, never pick for them. A product without variants ignores a stray id. Quantities are whole numbers. The same applies to `/create-lead`, Sambad orders, edit items, the POS sale routes and exchange items.
 
 ### POS sale — `POST /order/create-via-pos/:store_id`
 

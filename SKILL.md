@@ -575,6 +575,7 @@ There's **no single "update product"** route. Editing one existing product is sp
   "continue_selling": true,
   "price": 0, "compare_at_price": 0, "cost_per_item": 0,
   "weight": 0, "quantity": 0,
+  "expected_quantity": 0,                 // the stock you READ before this edit (see below)
   "sku": "", "exim_code": "",             // exim_code = HS code
   "color_name": "", "size_name": "",
   "colors": [], "sizes": [],
@@ -584,21 +585,29 @@ There's **no single "update product"** route. Editing one existing product is sp
       "_id": "<existing variant _id>",    // OMIT to create a new variant
       "option_name": "Red / L",           // used for matching (fallback if no _id)
       "price": 0, "compare_at_price": 0, "cost_per_item": 0,
-      "quantity": 0, "weight": 0,
-      "sku": "", "exim_code": "",
+      "quantity": 0, "expected_quantity": 0,   // the variant's stock as you READ it
+      "weight": 0,
+      "sku": "", "exim_code": "", "alt_barcode": "",
       "image_url": "https://.../variant.webp"   // per-variant image (single URL, NOT an array)
     }
-  ]
+  ],
+  "confirm": ["REMOVE_STOCKED_VARIANTS"]  // only when resending after a 409 (see below)
 }
 ```
 
-**Variant diff semantics — full-replace, not a patch.** The handler diffs your `variants[]` against what's stored:
+**Always send the complete payload, every field and every variant with its `_id`, plus `expected_quantity` next to each quantity.** That is safe on every backend. What changed on 2026-10-18 (blanxer-backend `test/inventory-rules`, rules in its `docs/inventory-rules.md`), and what the older backend still does until that ships:
 
-- Match by `option_name` first, then by `_id` → **updates** that variant's fields in place. Existing barcode is preserved.
-- No match / no `_id` → **creates** a new variant. Auto-assigns a barcode (`product.barcode + 3-digit suffix`). Cap: 500 variants/product.
-- Any existing variant not in your `variants[]` → **deleted** (`$pull`).
+| | Backend before 2026-10-18 | Backend from 2026-10-18 |
+|---|---|---|
+| A field you leave out | **defaulted**: `quantity` → 0, `variants` → `[]` (deletes every variant), `alt_barcode` / `exim_code` → `''` | left as it is |
+| Stock on a simple store | `quantity` is **set** as sent: a sale made between your read and your write is undone | with `expected_quantity` (the number you read), stock moves by `quantity − expected_quantity`, so that sale is kept; without it, set as sent |
+| Matching variants | by `option_name` first, then `_id` (a rename chain can delete a variant) | by `_id`, then by name only for rows without one |
+| A stocked variant left out | `$pull`ed, its batches orphaned (unsellable but still counted) | **409** `needs_confirmation` `REMOVE_STOCKED_VARIANTS`: nothing is saved; on the user's yes, resend with `"confirm": ["REMOVE_STOCKED_VARIANTS"]` and its stock is written off, then it goes |
+| Options added to a product holding stock with no option | that stock becomes unsellable | **409** `STOCK_WITHOUT_OPTION`, same yes / `confirm` loop |
 
-Always send the **complete** variant set — a partial payload will delete every variant you leave out.
+- No match / no `_id` → **creates** a new variant (barcode auto-assigned as `product.barcode + 3-digit suffix`; cap 500 per product).
+- A variant product's own `quantity` is the sum of its variants on the new backend; don't send a separate number for it.
+- **409 handling:** the answer is `{ "message": "...", "needs_confirmation": { "code", "action", "details" } }`. Show the message to the user, ask, and only on a yes resend the same request with `confirm: [code]` (codes add up if a second question follows). Never confirm on the user's behalf.
 
 **3. `POST /product/custom_fields/{store_id}/{product_id}`** — **tags**, custom fields, similar products, release date. This is the *only* edit route that writes `tags`. Body (`edit-product-custom-fields.ts`):
 
@@ -619,7 +628,7 @@ The handler also recomputes `search_key` from name + categories + colors + sizes
 
 **Two things to watch on updates:**
 
-- **Advanced-inventory stores (Platinum + `website_outlet`):** the `quantity` and `variants[].quantity` fields on handler #2 are **ignored** — the batch ledger owns stock. Adjust via `POST /inventory/stock-in` / `write-off` / `transfer-stock` instead. On non-advanced stores, these fields *are* the stock (absolute set, not delta) — the exact opposite behavior.
+- **Advanced-inventory stores (`use_advanced_inventory` + `website_outlet`):** the `quantity` and `variants[].quantity` fields on handler #2 are **ignored** — the batch ledger owns stock. Adjust via `POST /inventory/stock-in` / `write-off` / `transfer-stock` / `adjust-batch` instead. On non-advanced stores these fields *are* the stock: set as sent, or moved by `quantity − expected_quantity` when you send `expected_quantity` (new backend, see the table above).
 - **SKU uniqueness is store-wide** (base SKU + every variant SKU). A collision throws `SKU already in use: …`. Same rule that applies on create.
 
 **Images on update — upload first, then reference.** You can't attach raw files to the update handlers. Multipart upload each new image via `POST /product/{store_id}/file`, then pass the returned `file_url` into `image_urls[]` on handler #1 or `image_url` on individual variants on handler #2. Raster inputs (JPG/PNG/HEIC) come back as `...product_image-….webp` (server-side WebP q95).
@@ -646,13 +655,15 @@ Authorization: Bearer <token>
 
 Response: `200 {"success": true}`. Only DELETE with the full `/product/{store_id}/{product_id}` path works — variants like `/product/{id}` or `/product/delete/{id}` return 404 or 500. Role required: **owner** (not manager).
 
-**⚠ Delete does NOT cascade inventory.** The endpoint calls `deleteOne()` on the Product document only. Batches, stock ledger entries, and `inventory_summary` stay behind as orphaned stock — the totals dashboard, cost of inventory, and outlet on-hand counts stay inflated. **Always write off remaining stock before delete**, in this order:
+**Stock still in the product's batches (advanced stores).** On the backend from 2026-10-18 the delete (single, and `bulk_delete`) answers **409** `needs_confirmation` `WRITE_OFF_STOCK` ("X (5) still has stock. Delete and write that stock off?") and deletes nothing. Ask the user; on a yes resend with `?confirm=WRITE_OFF_STOCK` (single `DELETE`) or `"confirm": ["WRITE_OFF_STOCK"]` in the `bulk_delete` body: the backend writes the stock off (`SYSTEM_FIX`, "Product deleted") through the ledger, then deletes.
+
+**On the older backend the delete does NOT cascade inventory**: batches, ledger rows and `inventory_summary` stay behind as orphaned stock (totals, inventory value and outlet on-hand stay inflated). The manual recipe works on both, so use it when you can't tell which backend is live:
 
 1. `GET /inventory/batch/{store_id}?product={id}&hasStock=true&per_page=100` → collect batches; group by `outlet`; sum `quantity`. If `meta.total = 0`, skip to step 3.
-2. **One `POST /inventory/write-off` per distinct outlet** — write-off is scoped `outlet_id + batches[]`, so a product with stock at 2 outlets needs 2 write-off calls. Use `subtype: "SYSTEM_FIX"` (product-deletion cleanup, not damage) with the exact per-batch remaining quantity as the write-off quantity.
+2. **One `POST /inventory/write-off` per distinct outlet** (scoped `outlet_id + batches[]`), `subtype: "SYSTEM_FIX"`, the exact per-batch remaining quantity, and a `client_request_id`.
 3. `DELETE /product/{store_id}/{product_id}`.
 
-If the order is reversed (delete first, then write-off), write-off still succeeds because batches are found by product ref regardless — but the write-off's `Product.inventory_summary` update silently no-ops since the Product doc is gone, leaving `stock_ledger` correct but `inventory_summary` stale. Doing write-off first keeps everything in sync. Full recipe with payload shapes is in `references/api.md` under "Deleting a product cleanly".
+Write off first, then delete: the other way round leaves `inventory_summary` stale. Full recipe with payload shapes is in `references/api.md` under "Deleting a product cleanly".
 
 **Required create-product body fields:** `name`, `description`, `continue_selling` — everything else has a server default. Keep `description: ""` if the user hasn't provided one (server accepts empty string).
 
@@ -717,7 +728,7 @@ Cost is flat regardless of batch size: 1 store read, 1 product read, ≤1 brand 
 | Route | Cap | Roles | Notes |
 |---|---|---|---|
 | `POST /product/{store_id}/bulk_status` | 2000 ids | owner, manager | `{product_ids: [...], status: "Active"\|"Draft"\|"Archived"}`. Malformed ids are dropped, not fatal. Returns `{success, updated}`. |
-| `POST /product/{store_id}/bulk_delete` | — | owner, manager | Still does **not** cascade inventory — write off stock first (see the delete recipe above). |
+| `POST /product/{store_id}/bulk_delete` | — | owner, manager | From 2026-10-18: a product with stock answers 409 `WRITE_OFF_STOCK`; on the user's yes resend with `"confirm": ["WRITE_OFF_STOCK"]` (stock written off, then deleted). Older backend: no cascade, write off first (see the delete recipe above). |
 | `POST /product/{store_id}/bulk_add` (CSV) | 3000 rows | owner, manager + premium **or POS** plan | Barcode range reserved atomically; rows whose SKU already exists or repeats in the file come back in `rejected` with `reject_reason`. |
 | `POST /product/{store_id}/bulk_edit` (CSV) | **3000 rows** (was 500) | owner, manager | Multipart, so the 1 MB JSON cap doesn't apply. |
 | `POST /store/{store_id}/categories/bulk_seo` | 500 | owner, manager | SEO fields only; any other key fails that item. |
@@ -841,26 +852,16 @@ is_advanced_inventory = (
 )
 ```
 
-**If the plan is not `platinum`, treat the store as non-advanced regardless of any flag values.** Advanced inventory is a Platinum-only server-side feature (`POST /inventory/enable` throws on any other plan), so `basic` / `premium` / `pos` / `plus` / no-plan stores can never be truly in advanced mode — if you see the flags set on a non-platinum store, it's data drift, ignore it and use the non-advanced path (put stock directly in `quantity` and `variants[].quantity` on the create call).
+**The rule is the backend's: advanced = `use_advanced_inventory === true` AND `website_outlet` set** (every checkout, POS and stock path uses exactly this). Advanced inventory can be turned on for **Platinum and POS** plans (`canUsePos`); a store with the flag but no `website_outlet` is half-migrated: treat it as non-advanced. The plan check in the snippet above is a safety net for data drift on other plans, not the rule.
 
-For Platinum stores, both flags must additionally be true — `website_outlet` is only set as a side-effect of the enable migration, so a Platinum store with `use_advanced_inventory=true` but no `website_outlet` is in a half-migrated state; treat it as non-advanced too.
-
-**Legacy note — the older two-flag check (still true, but incomplete without the plan gate):**
-
-```python
-is_advanced_inventory = store.get("use_advanced_inventory") is True and bool(store.get("website_outlet"))
-```
-
-The flag alone is insufficient — `website_outlet` is only set as a side-effect of the enable migration. A store with `use_advanced_inventory=true` but no `website_outlet` is in a half-migrated / broken state; treat it as non-advanced (use direct-quantity flow, not stock-in).
-
-**⚠ Never auto-run `POST /inventory/enable`.** It's **Platinum-only** (throws for any other plan), NOT bodyless (requires an outlet payload), and is a **one-way migration** — walks every existing product and seeds `OPENING_BALANCE` batches from current quantities, then sets `website_outlet`. Two BETA stores are blocked entirely. If the user asks to enable advanced inventory, hand them the payload shape and confirm the outlet fields with them; don't fire it as a side-effect of an upload.
+**⚠ Never auto-run `POST /inventory/enable`.** Platinum or POS plan, NOT bodyless (outlet fields), and **one-way**: it seeds `OPENING_BALANCE` batches from current quantities and sets `website_outlet`. Two BETA stores are blocked. From 2026-10-18 it can be retried after a failure, reuses a store's single existing outlet (POS-signup stores), counts stock already in batches only once, and sets every total from the batches. If the user asks for it, hand them the payload and confirm the outlet fields; never fire it as a side-effect of an upload.
 
 **Branch on the two flows:**
 
 | Mode | Product-create body | Stock adjustment | Stock read |
 |---|---|---|---|
-| **Advanced** (Platinum + `website_outlet`) | `quantity` forced to 0; must call `POST /inventory/stock-in` per outlet after | `write-off` / `transfer-stock` / `stock-in` on the batch ledger. Editing quantity via product-edit is **ignored**. | `/inventory/list`, `/inventory/summary`, `/inventory/batch` |
-| **Non-advanced** (every non-Platinum store, or Platinum-but-not-enabled) | `quantity` and each `variants[].quantity` in body **is** the stock — no follow-up call | `POST /product/variant_inventory/{store_id}/{product_id}` — sets absolute values (not deltas). Owner/manager. | `GET /product/pos/{store_id}` or `GET /product/{store_id}/{product_id}`. **`/inventory/*` endpoints return empty** because there's no `Batch` collection populated. |
+| **Advanced** (`use_advanced_inventory` + `website_outlet`) | `quantity` forced to 0; must call `POST /inventory/stock-in` per outlet after | `write-off` / `transfer-stock` / `stock-in` on the batch ledger. Editing quantity via product-edit is **ignored**. | `/inventory/list`, `/inventory/summary`, `/inventory/batch` |
+| **Non-advanced** (flag off, or no `website_outlet`) | `quantity` and each `variants[].quantity` in body **is** the stock — no follow-up call | `POST /product/variant_inventory/{store_id}/{product_id}` with the full payload + `expected_quantity` (moves by the difference on the new backend; sets the value on the old one). Owner/manager. | `GET /product/pos/{store_id}` or `GET /product/{store_id}/{product_id}`. **`/inventory/*` endpoints return empty** because there's no `Batch` collection populated. |
 
 Full endpoint reference for both paths lives in `references/api.md` under "Advanced-inventory detection" and "Non-advanced path".
 
@@ -891,13 +892,15 @@ is_premium = plan in {"pos", "basic", "premium", "platinum", "plus"}
 
 ### Post-upload adjustments
 
-When the source (notebook, count) says an already-uploaded product's quantity should change, DON'T re-create the product. Adjust the batch ledger instead:
+When the source (notebook, count) says an already-uploaded product's quantity should change, DON'T re-create the product. Adjust the batch ledger instead.
+
+**Every stock move takes a `client_request_id`** (stock-in, bulk stock-in, write-off, transfer-stock, adjust-batch; backend from 2026-10-18). Make one per intended move and **reuse it when you retry after a timeout**: the backend applies it once and answers the retry from the first one. A new move gets a new id. (The older backend ignores the field, so a retry there doubles the stock: check `/inventory/list` before retrying.) Quantities are whole numbers.
 
 - **Decrease** (e.g. notebook says "-1"): fetch `batch_id` via `GET /inventory/batch/{store_id}?product={id}&outlet={outlet_id}&hasStock=true`, then `POST /inventory/write-off` with `subtype: "COUNT_CORRECTION"` and `{batch_id, quantity: n}`.
 - **Increase — a miscount on a batch you already have:** `POST /inventory/adjust-batch` with `{store_id, outlet_id, batch_id, quantity, subtype: "COUNT_CORRECTION"}` (or `"SYSTEM_FIX"`). This raises **that** batch's on-hand in place, so a correction no longer spawns a phantom batch at a possibly-wrong cost. This is the right call for "the shelf has 3 more than the system says".
 - **Increase — genuinely new stock arriving:** `POST /inventory/stock-in`, which creates a new batch (correct: new delivery, its own cost price and dates).
 - **Fix a batch's dates or bin** (typo'd expiry, missing mfg date): `POST /inventory/update-batch` with `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}`. `null` clears a field, omitted leaves it. It deliberately **cannot** change quantity or `batch_code` — quantity stays on stock-in/write-off/adjust so the ledger can't diverge, and `batch_code` keeps matching the supplier's paperwork. Writes no ledger row. Worth doing: `expiry_date` drives the expired / expiring-soon cards, the expiring filter, the export, **and sell order**.
-- **Move between outlets**: `POST /inventory/transfer-stock` with `{target_outlet, batches:[{batch_id, quantity}]}`. Note it **copies** `bin_location` and the dates onto the destination batch, so fixing them at the source afterwards does not update the copy.
+- **Move between outlets**: `POST /inventory/transfer-stock` with `{target_outlet, batches:[{batch_id, quantity}]}` (both outlets must be this store's). Note it **copies** `bin_location` and the dates onto the destination batch, so fixing them at the source afterwards does not update the copy.
 - **Verify**: `GET /inventory/list/{store_id}?outlet={outlet_id}&product_id={id}` — check `current_stock`. For the full picture on one product (stock by outlet, in/out flow, sales at true batch cost, batch age and expiry, cost by supplier, recent movements) use `GET /inventory/product/{store_id}/{product_id}?days=90`.
 
 **Sell order is FEFO, not FIFO.** `handle-inventory-reduction.ts` sorts candidate batches by `expiry_date` first and `created_at` only as the tie-break, so the batch that expires soonest is consumed first; batches with no expiry date sort after those, oldest first (which degrades to plain FIFO when nothing has an expiry). This means a wrong `expiry_date` doesn't just skew a dashboard card — it changes which stock gets sold. (Some older comments in the repo still say FIFO; the allocation code is the one that counts.)
