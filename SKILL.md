@@ -1,6 +1,6 @@
 ---
 name: blanxer-skill
-description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images (printed BILL FORM + handwritten notebook selling prices), per-outlet stock-in; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks to set, add, remove, or bulk-edit product tags (coming_soon, no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirect buttons, key:value and seller:<name> facets) on one product or the whole catalogue; asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges or categories; drops a folder of handwritten bill images into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup. Skip only when the user explicitly wants Blanxer's native CSV importer or the dashboard UI.
+description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images, per-outlet stock-in; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks to set, add, remove, or bulk-edit product tags (coming_soon, no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirects, key:value and seller:<name> facets); asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split, a code on an order), offers or discount codes (BOGO, tiers, gifts, bundles, free delivery, coupons), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges or categories; drops a folder of handwritten bill images into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup. Skip only when the user explicitly wants Blanxer's native CSV importer or the dashboard UI.
 ---
 
 # Blanxer Product Upload
@@ -33,6 +33,7 @@ Only two things are needed just to load the skill — everything else depends on
    - Set or bulk-edit product tags (special tags, seller/facet tags) on existing products
    - Delete products cleanly (write-off orphan stock, then delete)
    - Orders / transactions / analytics query
+   - Offers and discount codes (create, change, pause, check how they do)
 
 Do NOT batch-ask for outlet, CSV path, channel, images, delay, etc. in the opening question. Those are workflow-specific and irrelevant if the user just wants a report or a label reprint. Ask them **only** after the user picks a workflow.
 
@@ -149,6 +150,8 @@ def upload_to_blanxer(store_id, token, cf_headers, file_path):
 **Delete products** needs: the product IDs to delete. Warn about the write-off-first orphan-stock recipe (see `references/api.md` → "Deleting a product cleanly") before executing.
 
 **Orders / transactions / analytics** need: date range (or use defaults per endpoint) and, for POS reports, optional groupBy/format. See `references/api.md`.
+
+**Offers / discount codes** need: what the customer gets, on which products or categories, the dates, and any limits (total uses, once per customer, minimum order). Check the store is on Offers first (see "Offers and discount codes" below).
 
 Never fabricate an answer. Restate what you're about to do in a one-line dry-run summary (see step 3 of the workflow) before firing any batch mutation.
 
@@ -950,6 +953,20 @@ Print requests are one-shot but **fully independent of the upload session** — 
 - **By-quantity** (`GET /product/generate_barcode_quantity/...`) — caller picks exact copies; use when they want a specific count irrespective of stock ("3 spare tags").
 
 Both need CF browser headers on POST + GET. Full recipe (product-ID discovery via `/product/pos/{store_id}` or `/product/{store_id}/{product_id}`, mode selection, variant keying) in `references/api.md` under "Reprinting barcodes on demand".
+
+## Offers and discount codes
+
+Blanxer's **Offers** plugin replaces coupons: automatic discounts, discount codes, buy more save more (tiers), buy X get Y, bundles, free gifts and free delivery, on the website, manual orders and POS. **The server prices everything; never compute a discount yourself.** Full routes and bodies: `references/api.md` → "Offers".
+
+1. **Use the Blanxer MCP if it is connected.** `blanxer_get_store_context` says whether the store is on Offers; then `blanxer_how_to { operation }` (`create_discount_code`, `create_automatic_offer`, `buy_more_save_more`, `buy_x_get_y`, `free_gift`, `bundle_offer`, `offer_performance`) gives the exact call, and `blanxer_create_offer` / `blanxer_update_offer` / `blanxer_set_offer_status` / `blanxer_quote_cart` / `blanxer_get_offer_performance` do the work. They check ids first and merge partial edits. The direct API below is the fallback and the reference.
+2. **The store must have the Offers plugin on** (`store.plugins` → `offers`, `details.enabled !== false`; every plan can have it). If it's off, say so: the owner turns it on in the dashboard (Offers in the menu), which moves the existing coupons into Offers with the same codes and counts. Don't switch it on through the API without the owner's yes. Until then a code is a coupon (website checkout only).
+3. **Create** with `POST /promotion/{store_id}` (owner/manager). Show the user the offer in plain words first (what the customer gets, products, dates, limits, where it works) and create it after their yes. **Update replaces the whole offer**: read it (`GET /promotion/{store_id}/{id}`), change the field, send it all back. Pause / resume / archive with `POST /promotion/{store_id}/{id}/status`.
+4. **Orders with a code** (manual or POS): quote first with `POST /promotion/{store_id}/quote` (`channel: 'manual' | 'pos'`, the lines, `code`, `place`, the customer's phone). Tell the user the total and which offers apply, then create the order with the same lines plus `code` (and `removed_offers` / `gift_choices` if the user chose). A code the server refuses creates nothing; report its message.
+5. **Never add gift lines.** Quote lines with `added_by` (gifts, free buy-X-get-Y items) are added by the server on every order. Sending them as products charges them as extra items.
+6. **Stock is unchanged by offers, in both inventory modes.** Gifts and free units are real order lines at 100% off: the server holds and reduces them exactly like paid units (simple stores: the product `quantity`; advanced stores: the selling outlet's batches, FEFO, batch cost into cost of goods). A gift that is out of stock is left off; it never fails the order. Don't adjust stock for gifts by hand.
+7. Staff discounts still work: `discount` on admin create and POS applies **after** the offers.
+
+**Stores without Offers (coupons):** `/coupon/{store_id}` CRUD as before. Since backend PR #325: codes are not case-sensitive, applying a code holds nothing (`POST /public/coupon`, 40 per 10 minutes per IP), a use is claimed with the order and given back on cancel, failed payment or an abandoned online checkout, and retention SMS codes only work for the phone they were sent to. A manual order on such a store can't take a code: give the amount as `discount`.
 
 ## Failure modes to watch for
 
