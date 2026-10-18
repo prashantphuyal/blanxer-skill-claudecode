@@ -1013,7 +1013,10 @@ Auth conventions: `authRoleCheck()` with no args = any authenticated store user;
   "payment_status": "Paid",
   "payment_method": "cash",
   "partial_payment_amount": 0,
-  "force": false
+  "force": false,
+  "code": "",                // Offers stores: a discount code (quote it first), see "Offers"
+  "removed_offers": [],      // Offers stores: automatic offers to leave off
+  "gift_choices": {}         // Offers stores: { <offer id>: "productId|variantId" }
 }
 → { "status": "success", "_id", "order_number" }
    // or { "status": "halt", ... } if same-phone order exists within 7 days and force=false
@@ -1041,6 +1044,7 @@ Auth conventions: `authRoleCheck()` with no args = any authenticated store user;
 - `split` requires both `cash_amount>0` and `qr_amount>0`, and `cash+qr == total-discount`.
 - `qr` / `split` trigger Fonepay dynamic QR — poll `POST /order/pos-check-qr-status/:store_id`.
 - POS orders are created with `status: "Completed"`, `channel: 3` (POS).
+- Offers stores: also `code`, `removed_offers`, `gift_choices`; offers apply before the cashier `discount`, so size `cash_amount` / `qr_amount` to the quoted total (see "Offers").
 
 ### ⚠ Custom (non-catalog) line items
 
@@ -1069,7 +1073,7 @@ There is **no `is_custom` flag**. A line is "custom" purely when `product` is em
 → { "success": true }
 ```
 
-Sentinel values: `-1` = keep current, `0` = clear (partial → `Unpaid`), `>0` = set (partial → `Partial`). `discount: -1` ignored if the order came from a coupon.
+Sentinel values: `-1` = keep current, `0` = clear (partial → `Unpaid`), `>0` = set (partial → `Partial`). `discount: -1` ignored if the order came from a coupon. On an order priced by Offers, send the lines as the order shows them (gift / free units included); the server re-prices with the order's saved offers, and `discount` is the staff's extra on top.
 
 Editable only when `status ∈ {Draft, Pending, Processing}` and `payment_status != "Paid"`. The single-order GET returns a `can_edit_items` boolean telling you this upfront.
 
@@ -1112,7 +1116,7 @@ Editable only when `status ∈ {Draft, Pending, Processing}` and `payment_status
 
 **`ordered_products` subdoc**: `product_id?` (absent for custom), `product_name`, `price`, `compare_at_price`, `cost_per_item`, `customization_charge`, `variant_id`, `variant_name`, `quantity`, `remained_quantity`, `sku`, `discount_amount`, `custom_fields[]`, `categories[]`.
 
-**Order-level discount**: `{discount_id, code, d_value, d_type(1 FLAT | 2 PERCENT | 3 SHIPPING)}`.
+**Order-level discount**: `{discount_id, code, d_value, d_type(1 FLAT | 2 PERCENT | 3 SHIPPING), claim?}`. `claim` (`claimed` | `released`) marks whether a storefront coupon's use is held by this order. Offers orders add `promotions[]`, `promo_total`, `delivery_charge_before_promo` and per-line `promo_discount` / `promo_allocations` / `free_qty` (see "Offers").
 
 **Partial-payment integrity rule** (all endpoints): `discount + partial_payment_amount ≤ product_total (+ delivery_charge in change_order)`.
 
@@ -1199,7 +1203,10 @@ customer_address_city: string, min 2, max 320             (REQUIRED)
 customer_address: string, min 2, max 320                  (REQUIRED)
 customer_address_landmark: string, max 320, default ''
 order_note: string, max 320, default ''
-coupon: string, default ''         // treated as applied if length > 20
+coupon: string, default ''         // stores without Offers: the coupon _id; read only if length > 20 (a 24-hex id, else looked up as a code)
+code: string ≤40, default ''       // stores with Offers: the typed code (any case); one per order
+removed_offers: string[] ≤20       // stores with Offers
+gift_choices: { [offerId]: 'productId|variantId' }   // stores with Offers
 url: string, default ''
 paymentMethod: string, default 'COD'   // free string, not enum — only 'COD' is special-cased
 ip / user_agent: server-injected
@@ -1210,7 +1217,9 @@ ip / user_agent: server-injected
 - **No custom line items** — every entry MUST reference a real catalog product. Empty `product` values are filtered out; if none remain → `"Product is required"`. Variant required if the product has variants. Out-of-stock rejected unless `continue_selling`.
 - `paymentMethod` is a **free string**; only `'COD'` is special-cased. If `paymentMethod == 'COD'` and the delivery location has COD disabled → rejected.
 - **Status set to `'Pending'`** if `paymentMethod == 'COD'`, else `'Inactive'`. COD orders immediately reduce inventory; non-COD wait for payment.
-- **Silent no-op success for spam**: emails containing `mailinator.net` or phone `0000000000` return the shape below with `_id: ''` and no order created.
+- **Silent no-op success for spam**: emails containing `mailinator.net` or phone `0000000000` return the shape below with `_id: ''` and no order created. The code / coupon isn't checked on this path.
+- **Coupons (stores without Offers), since backend #325:** codes are trimmed and upper-cased (not case-sensitive); `POST /public/coupon` holds nothing and is rate-limited to 40 / 10 min / IP; the use is claimed inside the order's transaction (the loser of a last-use race gets `This coupon has just been used up`) and given back on cancel, failed payment or an expired unpaid checkout; retention SMS codes are bound to the order's phone (another phone: `Coupon code not available`).
+- **Offers stores:** the order is priced by the offers engine; a rejected `code` fails with HTTP 401 `{"fields":{"code": "<message>"}}` and the response adds `offers {applications, code, totals}`. Never send gift lines (`added_by` in a quote) as products.
 
 **Response:**
 
@@ -1312,7 +1321,10 @@ quantity: Number
 remained_quantity: Number       // stock snapshot at order time (for advanced inventory)
 sku: String
 vat_type: String
-discount_amount: Number         // default 0 — per-line discount
+discount_amount: Number         // default 0 — per-line discount (cashier / staff)
+promo_discount: Number          // Offers: this line's share of the offers (NOT in discount_amount; the order total is in discount.d_value)
+promo_allocations: [{promotion_id, amount}]
+free_qty: Number                // Offers: units of this line that are free (gifts, buy X get Y)
 custom_fields: [String]
 categories: [String]
 ```
@@ -1325,6 +1337,102 @@ categories: [String]
 - **`posCreateOrder`**: for `split`, `partial_payment_amount = cash_amount`.
 - **`changeOrderItems`**: `-1` = leave unchanged; `0` = clear (marks `Unpaid` if was `Partial`); `>0` = set + mark `Partial`.
 - **Global integrity rule everywhere**: `discount.d_value + partial_payment_amount <= product_total` (`+ delivery_charge` in `changeOrderItems`).
+
+## Offers (mount `/promotion`) — stores with the Offers plugin
+
+Re-verified against `gigbig_backend` branch `feat/offers-engine` (2026-10-18; not on `dev`/prod until that backend ships). Code: `src/features/promotion/`. Plan: `docs/money/plans/offers.md`.
+
+**Prefer the Blanxer MCP when it is connected**: `blanxer_list_offers`, `blanxer_get_offer`, `blanxer_create_offer`, `blanxer_update_offer`, `blanxer_set_offer_status`, `blanxer_quote_cart`, `blanxer_get_offer_performance` (and `blanxer_how_to { operation: 'create_discount_code' | 'create_automatic_offer' | 'buy_more_save_more' | 'buy_x_get_y' | 'free_gift' | 'bundle_offer' | 'offer_performance' }`). They check products, variants, categories and places first and merge partial edits for you. The routes below are what they call.
+
+### Is the store on Offers?
+
+`store.plugins` has `{ name: 'offers', details: { enabled, display } }`, on unless `enabled === false`. Read it from `GET /store/{store_id}` (`plugins`), or `GET /public/promotions/{store_id}` → `enabled`. Every plan can have it (no plan gate).
+
+- **Turn on / save settings:** `POST /store/{store_id}/update_plugin { name: 'offers', details: { enabled: true, display: {...} } }` (owner/manager). Turning it on **moves the store's coupons into Offers** (same `_id`, codes and use counts; safe to repeat). Ask the owner first; normally they switch it on in the dashboard (Offers in the menu).
+- **Off:** `POST /store/{store_id}/delete_plugin { name: 'offers' }`.
+- Not on Offers: codes are still coupons (`/coupon/...`, website checkout only). Don't create offers for such a store: its orders are priced with coupons, so an offer would never apply.
+
+### Staff routes
+
+Auth: Bearer JWT (from the `sk_` exchange), store role. Reads any staff; writes owner/manager.
+
+| Method | Path | What |
+|---|---|---|
+| GET | `/promotion/{store_id}?state=all\|live\|scheduled\|paused\|ended\|draft\|archived\|personal&q=&kind=&channel=` | `{ data: Offer[], counts: {all, live, scheduled, paused, ended, draft, personal} }`. `personal` = loyalty / retention codes. `q` matches title or code |
+| GET | `/promotion/{store_id}/summary?days=30` (or `from`/`to` YYYY-MM-DD) | `{ data: { days, revenue, orders, orders_share, discount, delivery_waived, gift_value, per_order, aov_with, aov_without } }` |
+| GET | `/promotion/{store_id}/report?from=&to=&channel=web\|manual\|pos` | Analytics "By offer" |
+| GET | `/promotion/{store_id}/{id}` | `{ data: Offer & { codes: Code[] } }` |
+| GET | `/promotion/{store_id}/{id}/claims?page=&per_page=&channel=` | `{ data: Claim[], pagination }`; each claim has `order {_id, order_number, customer, phone, status, payment_status, payment_method, total}` and `with` (the order's other offers) |
+| POST | `/promotion/{store_id}` | Create → `{ data: Offer }` |
+| POST | `/promotion/{store_id}/{id}` | Update. **The body replaces the whole offer**: read it first and send everything back with your change. A used offer can't change `kind` / `method` |
+| POST | `/promotion/{store_id}/{id}/status` | `{ status: 'active' \| 'paused' \| 'archived' }`. No hard delete; archive is final |
+| POST | `/promotion/{store_id}/quote` | Staff quote, `channel: 'manual' \| 'pos'` (below) |
+| POST | `/promotion/{store_id}/return-preview` | `{ order_id, items: [{product_id, variant_id, quantity}] }` → what a return refunds on an offers order (the kept items re-priced with the order's own offers) |
+
+`Offer` = the promotion plus `state` (draft / scheduled / live / ended / paused / archived), `code` (the shared code, upper case, or null) and `numbers { uses, orders, discount, revenue }`.
+
+### Create / update body (zod; errors come back as messages)
+
+```
+title (≤120), description?, kind: amount_off|free_delivery|bxgy|tiers|bundle|gift, method: automatic|code,
+code? (required for method code; letters, digits, - and _; ≤40; unique in the store, any case),
+status? active (default)|draft|paused, channels: ['web','pos','manual'] (min 1),
+starts_at?, ends_at? (ISO dates; end after start), combines { product, order, delivery }, priority? 0–100, skip_on_sale?,
+conditions { min_amount?, min_qty?, payment any|cod|online, places[], customers everyone|new|members|specific,
+             member_tiers[], customer_keys[] (10-digit phones, for 'specific') },
+limits { total?, per_customer? }   (null = unlimited)
+amount_off    { value_type percent|fixed, value, max_discount?, scope {type all|categories|products, categories[], products[{product_id, variant_ids[]}]} }
+free_delivery { value_type (percent), value (100 = free), max_discount? }
+tiers         { basis qty|amount, scope, per_product, levels[{min, value_type, value}] }   (each min bigger than the last, ≤10 levels)
+bxgy          { buy {basis qty|amount, min, scope}, get {qty, scope, value_type free|percent|fixed, value, add?{product_id, variant_id}}, repeat, max_free? }
+bundle        { items[{product_id, variant_id?, qty}] (≥2 units), price_type price|percent|fixed, value, max_sets?, slug, image_url }
+gift          { trigger {basis amount|products, min_amount, scope?, min_qty}, items[{product_id, variant_id?, qty}], auto_add, stop_when_out }
+display       { public, badge (≤30), top_bar, offers_page, countdown, promo_link }
+```
+
+- Fill the block named by `kind` (`'Fill in what the customer gets'` otherwise). Percentages ≤ 100.
+- `amount_off` with scope `all` is an **order** offer; any other kind/scope is a **product** offer; `free_delivery` is a **delivery** offer.
+- `combines` defaults (the dashboard's): product offers `{product:true, order:true, delivery:true}`; order offers and codes `{product:true, order:false, delivery:true}`; delivery offers `{product:true, order:true, delivery:false}`. Two offers combine only when both allow it.
+- A taken code: HTTP 401 `{"fields":{"code":"The code X is already used by another offer"}}`.
+- `display.public: false` keeps an offer off the website's lists (a code still works when typed).
+- The server doesn't check that product, variant or category ids exist in the store: resolve them first (`/product/{store_id}`, categories from the store). The MCP does this for you.
+- An archived offer can't be edited (`An archived offer can only be copied`); a used one can't change kind or method (`... Duplicate it instead.`).
+
+### Quote before an order with a code
+
+`POST /promotion/{store_id}/quote`:
+
+```json
+{ "channel": "manual",
+  "products": [{ "product": "<id>", "variant": "<id or ''>", "quantity": 2 },
+               { "product": "", "name": "Gift wrap", "price": 150, "quantity": 1 }],
+  "code": "DASHAIN10", "place": "Pokhara", "payment": "cod", "phone": "9800000000",
+  "customer_id": "<optional>", "outlet": "<pos outlet>", "removed_offers": [], "gift_choices": {},
+  "no_delivery_offers": false }
+```
+
+Returns `data: { lines[] (allocations, promo_discount, net, free_qty, added_by), applications[], code {code, status applied|rejected, reason, message}, delivery {before, discount, after, pending}, totals {gross, product_discount, order_discount, promo_discount, goods, delivery, total}, messages[], server_time }`. It writes nothing.
+
+- Quote first, tell the user the total and which offers apply, then create the order with the same lines and code.
+- **Never add gift lines yourself.** Lines with `added_by` (gifts, free BXGY items) are added by the server on every create; sending them as products charges them as extra items.
+- `no_delivery_offers: true` when staff type the delivery charge (the order's `override_delivery_charge ≥ 0` does the same).
+- A once-per-customer code needs the customer's phone (`phone` or `customer_id`), else `need_phone`.
+
+### Orders on an Offers store
+
+| Endpoint | Offer fields | Notes |
+|---|---|---|
+| `POST /order/create/{store_id}` (admin) | `code`, `removed_offers`, `gift_choices` | Offers first; the staff `discount` applies **after** them. `override_delivery_charge ≥ 0` turns delivery offers off. A rejected code fails with HTTP 400 `{message}` (the quote's `code.message`); nothing is created |
+| `POST /order/create-lead/{store_id}` | same | same |
+| `POST /pos/sale/{store_id}` and `POST /order/create-via-pos/{store_id}` | `code`, `removed_offers`, `gift_choices` | Cashier discounts apply after offers. Size the payment to the quoted total. A once-per-customer code needs `customer_id` / the customer's phone |
+| `POST /order/{store_id}` (storefront) | `code`, `removed_offers`, `gift_choices` (older `coupon` _id still works) | A rejected code: HTTP 401 `{"fields":{"code": message}}`. Response adds `offers {applications, code, totals}` |
+| `POST /order/change_order/{store_id}/{order_id}` | — | Send the lines as the order shows them; the server takes the free units out and re-prices with the offers **saved on the order** (not today's). `discount` is the staff's extra on top of the offers |
+
+- Another order taking the last use between quote and create fails the order (HTTP 400): `"<title>" has just been fully used. Please review your order.` / `The code X has just been fully used...` / `You've already used "<title>".` Quote again.
+- **Stock is the server's job, in both inventory modes.** Gifts and free units are real order lines at 100% off; they are held and taken from stock exactly like paid units (simple stores: `quantity`; advanced stores: the selling outlet's batches, FEFO, batch cost into cost of goods). A gift out of stock isn't added and never fails the order. Nothing in the order flow changes per mode because of offers; don't stock-adjust gifts by hand.
+- Claims (the use of an offer) are reserved at the order, count once paid / delivered / completed, and go back on cancel, return, failed payment or an abandoned online checkout.
+
+**Order fields:** `promotions[] {promotion_id, code, title, kind, class, method, amount, detail}`, `promo_total`, `delivery_charge_before_promo`; per line `promo_discount`, `promo_allocations[] {promotion_id, amount}`, `free_qty`. Product and order offer amounts are **inside `discount.d_value`** (so every total formula, courier COD and report stays right); a delivery offer lowers `delivery_charge` instead. `promo_discount` is **not** in the line's `discount_amount`. Older orders have none of these.
 
 ## Transactions (mount `/payment`)
 
