@@ -1218,6 +1218,16 @@ ip / user_agent: server-injected
 { "success": true, "_id", "order_number", "total_price", "total_quantity", "delivery_charge", "email", "slug": "" }
 ```
 
+### Store pickup (backend `claude/tsk-154`, not on `origin/dev` yet — rules in the backend's `docs/fulfilment-rules.md`)
+
+Platinum stores on advanced inventory with 2+ active outlets can let website shoppers collect an order at an outlet (Setting → Checkout → Store pickup & fulfilment).
+
+- **Storefront:** `check_domain` carries `store_pickup {outlets: [{_id, name, address, contact_number}], pay_at_store, advance}` (absent / empty = no pickup). The checkout sends `fulfilment: 'pickup'` + `pickup_outlet: <outlet _id>` on `POST /order/:store_id` and on the quote; `POST /order/public/pickup-stock` `{store, lines}` → per-outlet stock + a recommended outlet. No delivery charge; the address is still required. `paymentMethod: 'COD'` = **pay at the store** (refused when the store turned pay-at-store off; with a pickup advance it pays part online first like any advance order).
+- **The order:** `fulfilment {type: 'pickup', outlet, outlet_name}`, `order.outlet` = that outlet. Its stock comes from that outlet, and reports keep it a website (Online) sale under that outlet.
+- **Courier submits** on a pickup answer `409 needs_confirmation {code: 'PICKUP_ORDER'}`; resend with `confirm: ['PICKUP_ORDER']` only after the user says yes.
+- **Move the fulfilling outlet:** `POST /order/:store_id/:order_id/fulfil-from` `{outlet}` (staff; only before it is sent, not a counter sale, no courier booking). Stock moves with it.
+- Setting: `GET/POST /store/:store_id/checkout/fulfilment` (owner/manager) — `{pickup_enabled, pickup_outlets, choose_outlet, pickup_pay_at_store, pickup_advance {enabled, basis: fixed|percent, amount, percent}}`.
+
 ### Admin create lead — `POST /create-lead/:store_id`
 
 File: `task/admin-create-lead.ts`. Roles: owner/manager/csr. Nearly identical to `adminCreateOrder` except:
