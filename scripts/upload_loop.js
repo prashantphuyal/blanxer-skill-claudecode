@@ -33,10 +33,24 @@
   const CHANNEL   = 3;  // POS
   const DELAY_MS  = 3000;
   const TAGS      = []; // applied to every product, e.g. ['seller:acme']
+  // Rows with a cost of 0 or about the selling price (>= 97%) stop the run
+  // before anything is created. Set true only after the user confirms them.
+  const CONFIRM_COSTS = false;
   // -----------------------
 
   if (!PRODUCTS.length || !STORE_ID || !OUTLET_ID) {
     return 'ERROR: PRODUCTS, STORE_ID, and OUTLET_ID must be set before running.';
+  }
+  // The product's Cost Price = the bill's cost rate, and the batch is stocked in
+  // at the same cost. 0 or the selling price as cost makes every profit figure
+  // wrong (see "Cost price" in SKILL.md).
+  const suspect = PRODUCTS
+    .map((p, i) => ({ i: i + 1, name: p.name, cost: Number(p.costRate), sell: Number(p.sellingRate) }))
+    .filter((r) => !(r.cost > 0) || (r.sell > 0 && r.cost * 100 >= r.sell * 97));
+  if (suspect.length && !CONFIRM_COSTS) {
+    return 'ERROR: cost 0 or about the selling price on rows: ' +
+      suspect.map((r) => `#${r.i} ${r.name} cost=${r.cost} sell=${r.sell}`).join('; ') +
+      '. Fix the costs, or confirm with the user and set CONFIRM_COSTS = true.';
   }
 
   const token = localStorage.getItem('blanxer_access_token');
@@ -64,7 +78,7 @@
     showVariant: false, showColorPreview: false, continue_selling: true,
     price: p.sellingRate,
     compare_at_price: 0,
-    cost_per_item: 0,
+    cost_per_item: p.costRate,
     weight: 0,
     quantity: 0,
     sku: '',
