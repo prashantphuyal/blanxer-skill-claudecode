@@ -115,6 +115,17 @@ BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/fix_batc
 
 Batches it can't price (no product cost, no correct batch, or a cost far above the selling price) are listed in the CSV for the user. Supplier balances are left alone unless `--supplier-adjust`. Owner / manager key only.
 
+### Fix variant names (colours show, Size row empty on the website)
+
+The website finds a variant only by the exact name `Colour/Size` built from the product's colour and size lists. A variant named `Pink / 4 yrs` (spaces), or a colour-only product with a stray size list, shows its colours with an empty Size row and sells no variant. `fix_variant_names.py` renames each such variant in place (same id, so stock, batches and barcodes stay), adds a value a list is missing, and clears a list no variant uses:
+
+```bash
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/fix_variant_names.py           # dry run: what would change
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/fix_variant_names.py --apply   # after the user approves
+```
+
+Products whose names it can't place are listed for a person and never touched. Owner / manager key only.
+
 ### Reprint barcodes on demand
 
 By product ID list:
