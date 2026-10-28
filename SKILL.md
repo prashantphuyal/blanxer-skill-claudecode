@@ -586,7 +586,7 @@ There's **no single "update product"** route. Editing one existing product is sp
   "variants": [
     {
       "_id": "<existing variant _id>",    // OMIT to create a new variant
-      "option_name": "Red / L",           // used for matching (fallback if no _id)
+      "option_name": "Red/L",             // EXACTLY "<colour>/<size>" from colors/sizes — no spaces round "/" (see below)
       "price": 0, "compare_at_price": 0, "cost_per_item": 0,
       "quantity": 0, "expected_quantity": 0,   // the variant's stock as you READ it
       "weight": 0,
@@ -610,6 +610,7 @@ There's **no single "update product"** route. Editing one existing product is sp
 | A stocked variant left out | `$pull`ed, its batches orphaned (unsellable but still counted) | **409** `needs_confirmation` `REMOVE_STOCKED_VARIANTS`: nothing is saved; on the user's yes, resend with `"confirm": ["REMOVE_STOCKED_VARIANTS"]` and its stock is written off, then it goes |
 | Options added to a product holding stock with no option | that stock becomes unsellable | **409** `STOCK_WITHOUT_OPTION`, same yes / `confirm` loop |
 
+- **Variant names must be exactly `<colour>/<size>`, spelled as in `colors` / `sizes`** (just the value when the product has only one of the two lists; for a colour stored as `Pink:#hex` use `Pink`). The storefront builds the shopper's pick as that exact string and finds the variant's price, photo, stock and id by `option_name ===` it; its Size buttons are the sizes some variant of the chosen colour is named with. `"Pink / 4 yrs"` (spaces) is stored as sent and breaks the product on the website: the colours show, the **Size row is empty**, and add-to-cart carries no variant (Rimjhim, 2026-10-28). Every value a variant uses must be in `colors` / `sizes`, and a list no variant uses must be empty (a stray `sizes: ["Black"]` on a colour-only product makes the storefront look for `Black/Black`). Colours with a swatch are stored `Name:#hex` (the storefront splits on the first `:`), not `Name|#hex`. To repair a product, resend it through this handler with every variant's `_id` and the corrected `option_name` — the `_id` keeps its stock, batches and barcode. `scripts/fix_variant_names.py` finds and repairs these store-wide (dry run first, `--apply` to save).
 - No match / no `_id` → **creates** a new variant (barcode auto-assigned as `product.barcode + 3-digit suffix`; cap 500 per product).
 - A variant product's own `quantity` is the sum of its variants on the new backend; don't send a separate number for it.
 - **409 handling:** the answer is `{ "message": "...", "needs_confirmation": { "code", "action", "details" } }`. Show the message to the user, ask, and only on a yes resend the same request with `confirm: [code]` (codes add up if a second question follows). Never confirm on the user's behalf.
