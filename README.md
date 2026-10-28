@@ -103,6 +103,17 @@ Modes: `list`, `add` (union), `remove` (subtract), `set` (replace the array). Se
 
 Writes go through `POST /product/{store_id}/bulk_update` in chunks of 500, which patches only the `tags` field and so can't disturb anything else on the product. Reads are still per product (the admin list doesn't project `tags`). Pass `--legacy-writes` to fall back to the one-at-a-time `custom_fields` route — that one is a **full replace** whose `custom_fields` and `similar_products` default to `[]`, so the script echoes all three arrays back when using it.
 
+### Fix wrong batch costs (profit shows ~0% or 100%)
+
+Profit uses each stock batch's cost, not the product's Cost Price. Until 20 Sep 2026 the dashboard's stock-in pre-filled the selling price as the cost, and a product created without a cost was stocked in at 0. `fix_batch_costs.py` finds those batches. It takes the new cost from the product's Cost Price, else from the newest correctly costed batch, and corrects them through Blanxer's batch-cost correction, which also restates past sales:
+
+```bash
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/fix_batch_costs.py --preview   # dry run: CSV + totals
+BLANXER_API_KEY='sk_...' python3 ~/.claude/skills/blanxer-skill/scripts/fix_batch_costs.py --apply     # after the user approves
+```
+
+Batches it can't price (no product cost, no correct batch, or a cost far above the selling price) are listed in the CSV for the user. Supplier balances are left alone unless `--supplier-adjust`. Owner / manager key only.
+
 ### Reprint barcodes on demand
 
 By product ID list:
