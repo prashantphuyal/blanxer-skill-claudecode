@@ -20,6 +20,16 @@ Environment variables:
   BLANXER_REFERENCE Invoice / bill number recorded on each stock-in. Optional.
   BLANXER_BARCODE_PDF  Output path for the barcode PDF. Default: <BLANXER_CSV
                        directory>/barcodes.pdf. Set to "" to skip generation.
+  BLANXER_CONFIRM_COSTS  Set to 1 to upload rows whose cost is 0 or about the
+                    selling price (>= 97%). Without it the run stops before
+                    creating anything and lists those rows (see "Cost price"
+                    in SKILL.md). Default: unset.
+
+Cost: each product is created with cost_per_item = the row's cost rate (the
+product's Cost Price, which the dashboard suggests for later stock-ins) and its
+batch is stocked in at the same cost. Profit uses the batch cost, so a wrong
+cost here shows as wrong profit everywhere; fix one later with
+fix_batch_costs.py, never by editing the product's Cost Price alone.
 
 After create + stock-in, this also generates a barcode PDF (one page per unit
 of current on-hand stock) so the user can print labels immediately. The PDF is
@@ -110,11 +120,11 @@ def post(url, body):
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
-def create_product(name, selling, tags=None):
+def create_product(name, selling, cost, tags=None):
     return post(f"{BASE}/product/{STORE_ID}", {
         "name": name, "description": "", "long_description": "",
         "continue_selling": True, "channel": CHANNEL,
-        "price": selling, "compare_at_price": 0, "cost_per_item": 0,
+        "price": selling, "compare_at_price": 0, "cost_per_item": cost,
         "weight": 0, "quantity": 0,
         "showVariant": False, "showColorPreview": False,
         "slug": "", "brand": "", "categories": [],
@@ -143,6 +153,18 @@ def stock_in(product_id, qty, cost):
 
 
 rows = list(csv.DictReader(open(CSV_PATH)))
+
+# Costs that are almost certainly wrong: 0 (profit shows 100%) or about the
+# selling price (profit shows ~0). Stop before creating anything.
+suspect = []
+for i, r in enumerate(rows, 1):
+    c, s = int(r["cost_rate"]), int(r["selling_rate"])
+    if c <= 0 or (s > 0 and c * 100 >= s * 97):
+        suspect.append(f"  row {i}: {r['product_name']}  cost={c}  sell={s}")
+if suspect and os.environ.get("BLANXER_CONFIRM_COSTS") != "1":
+    print("These rows have a cost of 0 or about the selling price:", flush=True)
+    print("\n".join(suspect), flush=True)
+    sys.exit("Fix the costs in the CSV, or confirm them with the user and re-run with BLANXER_CONFIRM_COSTS=1.")
 print(f"Uploading {len(rows)} products with {DELAY_S}s delay (~{len(rows) * DELAY_S / 60:.1f} min)", flush=True)
 if GLOBAL_TAGS:
     print(f"Global tags on every product: {GLOBAL_TAGS}", flush=True)
@@ -155,7 +177,7 @@ for i, r in enumerate(rows, 1):
     qty, cost, sell = int(r["qty"]), int(r["cost_rate"]), int(r["selling_rate"])
     tags = merge_tags(r.get("tags"))
     t0 = time.time()
-    code, resp = create_product(name, sell, tags)
+    code, resp = create_product(name, sell, cost, tags)
     if code == 200 and resp.get("success"):
         pid = resp["product"]["_id"]
         scode, sresp = stock_in(pid, qty, cost)

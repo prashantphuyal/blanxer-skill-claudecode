@@ -1,6 +1,6 @@
 ---
 name: blanxer-skill
-description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images (printed BILL FORM + handwritten notebook selling prices), per-outlet stock-in; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks to set, add, remove, or bulk-edit product tags (coming_soon, no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirect buttons, key:value and seller:<name> facets) on one product or the whole catalogue; asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges or categories; drops a folder of handwritten bill images into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup. Skip only when the user explicitly wants Blanxer's native CSV importer or the dashboard UI.
+description: End-to-end automation for a Blanxer vendor store (app.blanxer.com) via direct API. Covers bulk product upload from CSV/Excel/paired bill images (printed BILL FORM + handwritten notebook selling prices), per-outlet stock-in; asks to add/upload/import/adjust/transfer/delete/reprint products, inventory, or labels; asks to set, add, remove, or bulk-edit product tags (coming_soon, no_price, main, team_order, show_color_chips, mirrago_tryon, rd_/ard_ redirect buttons, key:value and seller:<name> facets) on one product or the whole catalogue; asks about orders (create, edit, status change, POS sale, custom line items, cash+QR split), transactions/settlements/subscription, analytics (sales report, P&L, daily overview, shift close), delivery charges or categories; drops a folder of handwritten bill images into Downloads; or asks about supplier lookup, batch discovery, stock reconciliation, or product deletion cleanup. Skip only when the user explicitly wants Blanxer's native CSV importer or the dashboard UI. Also trigger for wrong cost price / wrong profit or margin, "profit shows 0% or 100%", batch cost correction, product cost vs batch cost, or fixing costs saved as the selling price or 0.
 ---
 
 # Blanxer Product Upload
@@ -403,7 +403,7 @@ When supplier context exists:
 
 ### 4. Run the upload loop (direct HTTP via API key)
 
-Fire `scripts/upload_direct_http.py` with `BLANXER_API_KEY`, `BLANXER_OUTLET_ID`, `BLANXER_CSV`, and optional channel/delay/tag/supplier overrides (`BLANXER_SUPPLIER` attaches the supplier to every batch the run creates, `BLANXER_REFERENCE` records the invoice number). It handles the `sk_ → JWT` exchange, sets the Cloudflare browser headers, loops create + stock-in per row with a configurable delay, and auto-generates the barcode PDF at the end.
+Fire `scripts/upload_direct_http.py` with `BLANXER_API_KEY`, `BLANXER_OUTLET_ID`, `BLANXER_CSV`, and optional channel/delay/tag/supplier/cost-confirm overrides (`BLANXER_SUPPLIER` attaches the supplier to every batch the run creates, `BLANXER_REFERENCE` records the invoice number). It handles the `sk_ → JWT` exchange, sets the Cloudflare browser headers, loops create + stock-in per row with a configurable delay, and auto-generates the barcode PDF at the end.
 
 For each product, include `image_urls: [<url1>, <url2>, ...]` (from step 3.5) in the create-product body. For POS-only uploads, `image_urls: []` is fine.
 
@@ -417,7 +417,7 @@ The script is the source of truth for payload shape. If you need to inline a sma
   "channel": 3,
   "price": <selling rate>,
   "compare_at_price": 0,
-  "cost_per_item": 0,
+  "cost_per_item": <cost rate from CSV — never 0, never the selling price>,
   "weight": 0,
   "quantity": 0,
   "showVariant": false,
@@ -591,6 +591,8 @@ There's **no single "update product"** route. Editing one existing product is sp
   ]
 }
 ```
+
+**`cost_per_item` here is the product's Cost Price (the suggestion for new stock).** On an advanced-inventory store, changing it does **not** change any batch's cost or past profit. If the old cost was wrong, also correct the batches (see "Cost price: product vs batch"), with the user's OK.
 
 **Variant diff semantics — full-replace, not a patch.** The handler diffs your `variants[]` against what's stored:
 
@@ -888,6 +890,34 @@ is_premium = plan in {"pos", "basic", "premium", "platinum", "plus"}
 | (No plan) | can't invite | n/a |
 
 (Own-gateway transactions = 0% regardless of plan.)
+
+### Cost price: product vs batch (read before any stock-in or cost change)
+
+On advanced-inventory stores there are **two costs**, and they are not linked:
+
+- **Product Cost Price** (`cost_per_item` on the product / variant): the cost **suggested for new stock**. Set it at create time to the bill's cost rate — the upload scripts do (`cost_per_item = cost rate`).
+- **Batch cost** (`cost_price` on each stock batch, set once at stock-in): what those units really cost. **Every profit figure uses the batch cost** (copied onto each sale), never the product's Cost Price.
+
+Rules for every stock-in (upload, `/inventory/stock-in`, `/inventory/bulk-stock-in`):
+
+1. The cost is the **purchase cost per unit** from the bill. Never 0, never the selling price. When the user gives no cost, ask Blanxer for the suggestion: `POST /inventory/item-costs` `{store_id, items:[{product_id, variant_id?}]}` → `suggested_cost` (the last correct batch cost, else the product's Cost Price, else `null` → **ask the user**).
+2. Before posting, `POST /inventory/stock-in-check` with `accept_kinds: ["equals_price"]`. Any warning (`above_price`, `equals_price`, `cost_jump`, `cost_drop`) → show it and get the user's OK first. The upload scripts stop on cost 0 / ≥97% of the selling price unless `BLANXER_CONFIRM_COSTS=1` (`CONFIRM_COSTS = true` in `upload_loop.js`).
+
+**Changing a product's Cost Price does NOT fix past profit.** If the user says the cost was wrong, correct the **batches**:
+
+- One batch: `POST /inventory/batch-cost/preview` `{store_id, batch_id, new_cost}` → show what changes (sales restated, profit change, supplier note) → `POST /inventory/batch-cost/correct` with `reason` and a `client_request_id`.
+- Several batches of one item: `POST /inventory/batch-cost/preview-many` / `correct-many` `{store_id, batch_ids, new_cost, reason, supplier_adjust, client_request_id (8–75 chars)}`.
+- Ask whether supplier balances should follow (`supplier_adjust`); default **no**.
+- Owner / manager only. The correction restates every past sale from the batch on its own date; analytics catch up within minutes; re-download reports.
+
+**Store-wide audit — "profit looks wrong", "margin is 0% / negative", "cost = selling price":** run `scripts/fix_batch_costs.py` (dry run first, always):
+
+```bash
+BLANXER_API_KEY=sk_… python3 scripts/fix_batch_costs.py --preview --out batch-costs.csv   # dry run: CSV + totals, nothing changes
+BLANXER_API_KEY=sk_… python3 scripts/fix_batch_costs.py --apply                          # after the user approves the CSV
+```
+
+It flags batches at cost 0 (any date) or at the selling price (−3% / +5%, received before 21 Sep 2026, when the dashboard pre-filled the selling price as cost). It also flags costs more than 5% above the price as typos. The new cost comes from the product's Cost Price when it is above 0 and below the price. Otherwise it comes from the newest correctly costed batch of the same item. Otherwise the user must enter it. Typos are never auto-fixed. The CSV lists every flagged batch with its source and the "user must enter" rows. Hand those to the user, then correct them one by one with the endpoints above. The same rules run server-side as `scripts/fix-prefilled-batch-costs.ts` in the backend, for Blanxer staff with database access.
 
 ### Post-upload adjustments
 

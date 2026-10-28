@@ -541,6 +541,68 @@ Two things that have **not** changed:
 2. Pass `supplier: "<_id>"` on every `stock-in` call of that delivery, with the bill number in `reference_number`.
 3. Only if the user asks for the payable: `POST /pos-finance/supplier-entry/{store_id}/{supplier_id}`.
 
+## Cost price and batch cost (verified against `gigbig_backend@origin/dev` 2026-10-28)
+
+Two costs on an advanced-inventory store:
+- `products.cost_per_item` / `variants[].cost_per_item`: the **suggestion** for new stock.
+- `batches.cost_price`: set once at stock-in, copied onto each sale. **Profit uses this one.**
+
+Editing the product's cost never changes a batch. Background: until dashboard `c2ce4116` (20 Sep 2026), the stock-in form pre-filled the selling price as the batch cost.
+
+### `POST /inventory/item-costs`
+
+- **What it does:** suggests a stock-in cost, and lists an item's batches.
+- **Auth:** inventory list access (`get_inv_list`).
+- **Body:** `{store_id, items:[{product_id, variant_id?|null}] (max 500), include_batches?: boolean}`.
+- **Response:** `{items:[{product_id, variant_id|null, price, product_cost, last_batch_cost|null, last_batch_at|null, suggested_cost|null, suggested_from:'last_batch'|'product'|null, batches?:[{_id, batch_no, outlet, outlet_name, cost_price, quantity, initial_quantity, sold, received_at, is_active}]}]}`.
+  - `quantity` is units left (0 = sold out). `sold` is net units sold from the batch.
+- **`suggested_cost` rule:**
+  - the newest batch with 0 < cost < 97% of price;
+  - else the product cost, when 0 < cost < price;
+  - else `null`. **Never the selling price.**
+- **Errors:** an unknown product or variant fails the **whole** call, so retry the items one by one.
+
+### `POST /inventory/stock-in-check`
+
+- **What it does:** warns about costs that look like typos. It is advisory only; nothing is blocked server-side.
+- **Body:** `{store_id, items:[{product_id, variant_id?, cost_price}], accept_kinds?: string[]}`.
+- **Response:** `{warnings:[{kind, product_name, variant_name, cost_price, price?, last_cost?, ratio?}]}`. The kinds:
+  - `above_price`: cost > selling price;
+  - `cost_jump` / `cost_drop`: cost ≥ 3× or ≤ ⅓ of the last batch;
+  - `equals_price`: cost is 97–100% of the price. Returned **only** when `accept_kinds` includes `"equals_price"`; old app builds crash on unknown kinds.
+
+### Batch cost correction (owner / manager only)
+
+Correct a batch's cost after the fact. One transaction covers:
+- the batch and its transfer copies;
+- the ledger `unit_cost`;
+- every sale's batch cost (restated on its own date);
+- the movement logs;
+- optional supplier debit/credit notes;
+- an audit row.
+
+The analytics days are marked for rebuild.
+
+The routes:
+- `POST /inventory/batch-cost/preview`
+  - Body: `{store_id, batch_id, new_cost}`.
+  - Response: old/new cost, units, sales restated (by month), stock value change, supplier notes proposed, and skipped orders (sold before batch costs were recorded).
+- `POST /inventory/batch-cost/correct`
+  - Body: `{store_id, batch_id, new_cost, reason (≥3 chars), expected_old_cost?, supplier_adjust (default false), client_request_id?}`.
+  - A repeat with the same `client_request_id` is a no-op.
+- `GET /inventory/batch-cost/history/{store_id}?batch_id=`
+  - Earlier corrections.
+- `POST /inventory/batch-cost/preview-many`
+  - Body: `{store_id, batch_ids (max 200), new_cost}`.
+  - Response: `{batches:[preview…], totals:{orders, cogs_change, stock_value_change}}`.
+- `POST /inventory/batch-cost/correct-many`
+  - Body: `{store_id, batch_ids, new_cost, reason, supplier_adjust, client_request_id (REQUIRED, 8–75 chars)}`.
+  - Each batch is its own correction, with id `<client_request_id>:<batch_id>`.
+  - Response: `{results:[{batch_id, success, correction?, repeated?, skipped?, reason?, error?}], totals:{orders, cogs_change, stock_value_change, corrected, skipped, failed}}`.
+  - A batch already at `new_cost` comes back as `{success:true, skipped:true, reason:'same_cost'}`.
+
+`scripts/fix_batch_costs.py` drives these for a whole store: dry run → CSV → `--apply`.
+
 ## Inventory adjustment (post-upload corrections)
 
 There is no single "set quantity to X" endpoint — the ledger model uses batches. Pick the right verb:
