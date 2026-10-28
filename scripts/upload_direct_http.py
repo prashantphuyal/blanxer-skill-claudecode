@@ -144,6 +144,9 @@ def stock_in(product_id, qty, cost):
     body = {
         "store_id": STORE_ID, "outlet_id": OUTLET_ID,
         "reference_number": REFERENCE,
+        # one key per new product's opening stock: re-sending this exact stock-in
+        # (after a timeout) is applied once on backends from 2026-10-18
+        "client_request_id": f"upload-{product_id}",
         "items": [{"product_id": product_id, "variant_id": "", "quantity": qty,
                    "cost_price": cost, "bin_location": ""}]
     }
