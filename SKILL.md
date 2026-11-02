@@ -45,7 +45,7 @@ Ask for whichever of these are relevant to what they picked, and only then:
 
 - **CSV path or bill-image folder.** If the user hasn't given one, ask. If you don't have filesystem access to the folder, call `request_cowork_directory` (typically `~/Downloads`).
 - **`outlet_id` / outlet name** (e.g. "Main Branch"). Resolve via `GET /inventory/outlets/:store_id`. If multiple match or none, list options and ask — don't pick.
-- **Product channel.** Codes: **Website = `2`**, **POS = `3`**, **All = `1`**. Default POS for stock-in flows from handwritten bills. Confirm if intent is unclear.
+- **Product channel.** Codes: **Website = `2`**, **POS = `3`**, **All = `1`**. Default POS for stock-in flows from handwritten bills. Confirm if intent is unclear. **On plan `pos` (no website, unlike Platinum) always use POS (`3`)**: never Website or All, and skip images and the 20-character description, which only the storefront needs. The POS plan is sold and renewed by the sales team: never quote a POS price or try to buy or renew it; point the owner to Contact sales on WhatsApp (+977 9802344850).
 - **Delay between products.** Default 3s. Ask if the batch is >100 or the user wants faster/slower.
 - **Tags.** Optional, but ask once — a store that uses seller/facet tags wants them set at create time, not back-filled. Accept a whole-run list (`BLANXER_TAGS`) or a per-row `tags` column. Full vocabulary and semantics in "Product tags" below.
 - **Images (Website / All channels only).** For POS-only uploads, skip. For Web/All:
