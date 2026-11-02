@@ -1687,6 +1687,15 @@ Uses `reconcileShift` — returns `IShiftReconciliation`:
 
 `GET /pos/activity/:store_id` (owner/manager) — audit log, not metrics.
 
+### Bank & cash accounts plugin (`money_accounts`, backend PR #360)
+
+- Installed = `money_accounts` in `store.plugins` (`GET /store/:store_id`). Without it the dashboard hides every account picker and screen; money taken with no account waits in Finance → Reconcile.
+- `POST /pos-finance/accounts-plugin/:store_id/install` (owner / manager, every branch) → `{ success, installed, channels: [{ channel, account, name, how: 'created' | 'linked' }] }`. Creates and links an account for each connected online gateway (one per money type), BlanxerPay's payout account and the counter Fonepay QR per merchant; a channel already in a live account is kept; running again makes nothing new. **The owner installs it from the dashboard; don't call it on your own.**
+- `POST /pos-finance/accounts-plugin/:store_id/uninstall` → `{ success }`. Hides the screens; accounts, entries and links stay.
+- A store's first account made by hand (`POST /pos-finance/bank-accounts/:store_id`) installs the plugin too.
+- While installed, saving a payment setting (a gateway turned on, the counter Fonepay connected) gives the new channel its account; `pos_fonepay_account` is no longer needed on connect.
+- `POST /pos-finance/customer-entry/:store_id/:customer_id` `type: PAYMENT`: `shift_id` and `bank_account` are optional. With neither, the orders are paid and their money waits in Reconcile.
+
 ### `/pos-finance` per-entity balances/ledgers (not dashboards)
 
 All any-store-member reads:

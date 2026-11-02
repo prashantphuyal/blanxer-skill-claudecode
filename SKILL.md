@@ -1002,6 +1002,17 @@ Blanxer's **Offers** plugin replaces coupons: automatic discounts, discount code
 
 **Stores without Offers (coupons):** `/coupon/{store_id}` CRUD as before. Since backend PR #325: codes are not case-sensitive, applying a code holds nothing (`POST /public/coupon`, 40 per 10 minutes per IP), a use is claimed with the order and given back on cancel, failed payment or an abandoned online checkout, and retention SMS codes only work for the phone they were sent to. A manual order on such a store can't take a code: give the amount as `discount`.
 
+## Bank & cash accounts (plugin)
+
+Since backend PR #360 (2026-11-01) keeping bank / wallet / cash balances in Blanxer is the **`money_accounts` plugin** ("Bank & cash accounts"). Most stores don't have it.
+
+1. **Check it first:** `store.plugins` has `money_accounts` (the MCP's `blanxer_get_store_context` → `money_accounts.installed`).
+2. **Not installed: never ask which account money went into or came from.** Record payments, refunds, expenses and stock-in payments without an account (refunds: an open drawer, store credit or "outside"; stock-in "paid now" as `payment_method: CASH`). The money waits in Finance → Reconcile, as any payment with no account always did.
+3. **Installed:** ask which account, never guess (as before).
+4. **Installing is the owner's action in the dashboard** (Plugins → Bank & cash accounts). Don't install it through the API on your own. What it does: every connected payment channel (eSewa, Khalti and other online gateways, BlanxerPay, the Fonepay QR at the counter per merchant) gets its own account, already linked; accounts can be renamed later and keep their statements. Endpoints in `references/api.md` under "Bank & cash accounts plugin".
+5. **Receive a customer's payment** (`POST /pos-finance/customer-entry/{store_id}/{customer_id}`, `type: PAYMENT`): `shift_id` / `bank_account` are optional. With neither, the customer's orders are paid and the money waits in Reconcile.
+6. **Connecting the counter Fonepay** needs no account: with the plugin on, Blanxer links one itself.
+
 ## Failure modes to watch for
 
 - **Bearer token expired (401)**: Tell the user to reload the Blanxer tab (it'll refresh the token), then retry the loop from where it stopped. Don't silently re-run successful items.
