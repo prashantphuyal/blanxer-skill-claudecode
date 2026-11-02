@@ -696,7 +696,11 @@ Response: `{"success": true, "file": {"file_url": "https://.../uploads/{store}/p
 
 One call per image. **The first URL in `image_urls[]` becomes the primary/thumbnail** — order matters.
 
-Alternate: `POST /product/{store_id}/{product_id}/file` (public, no `upload_purpose` needed) for images added to an already-created product. For the upload flow, use `/product/{store_id}/file` before create.
+Optional field `source_hash` = sha-256 hex of the original photo (before cropping): the dashboard and MCP send it so the same photo is found again instead of re-uploaded.
+
+**Already uploaded?** `GET /file/{store_id}/images?q=<file name part>&folder=<id|none>&page=&per_page=(≤60)&source_hash=<hex>` lists the store's images newest first (every plan and role; private files such as KYC documents and customer uploads are never listed). Reuse a hit's `file_url` instead of uploading again. Older backends answer it with an error.
+
+**Never use `POST /product/{store_id}/{product_id}/file`**: it is the storefront's public route for customer uploads (no auth; saved as `public_upload`, hidden from Media, not attached to the product). To add a photo to an existing product, upload through `/product/{store_id}/file` and add the URL to its `image_urls` with the general-info edit.
 
 **Server auto-converts raster images to WebP.** `fileUpload()` on the product routes is called without options (`product.routes.ts:83`) so `express-fileupload` applies no size cap, no `abortOnLimit`, and no MIME allowlist. The global `express.json()` / `urlencoded()` ~100 KB cap (`app.ts:29`) does NOT apply — multipart bypasses the JSON parser entirely. But `s3helper.ts s3Upload` (and its R2 mirror) rewrites the extension and pipes the body through `sharp(...).webp({ quality: 95 })` for any raster `image/*` mimetype:
 
@@ -713,7 +717,7 @@ Alternate: `POST /product/{store_id}/{product_id}/file` (public, no `upload_purp
 - **Don't send corrupt / non-image bytes with an `image/*` mimetype.** `sharp` is the implicit validator — if it can't decode, `.webp()` throws and you get a `500`.
 - **The `file_url` you save into `image_urls[]` will always be a `.webp` URL** for raster inputs. That's fine — the storefront and POS UI serve it directly.
 
-**Fail-soft rule:** if one image fails to upload, still create the product with whatever URLs succeeded rather than aborting the whole product. Log the failure and let the user re-upload later via `/product/{store_id}/{product_id}/file`.
+**Fail-soft rule:** if one image fails to upload, still create the product with whatever URLs succeeded rather than aborting the whole product. Log the failure and let the user re-upload later through `/product/{store_id}/file`, then add the URL to the product's `image_urls`.
 
 ### Store settings — `GET /store/{store_id}`
 
@@ -732,7 +736,7 @@ Handler: `store.controller.ts getStoreDetails`. Returns the entire store documen
   "name": "Example Store",
   "plan": "platinum",                     // top-level string — the plan-gate field
   "use_advanced_inventory": true,
-  "customization": { "image_ratio": 2 },  // 1=1:1, 2=4:3, 3=16:9
+  "customization": { "image_ratio": 2 },  // 1=1:1, 2=4:5 portrait, 3=9:16 portrait
   "setting": { /* payment secrets stripped for non-owners */ },
   ...
 }
@@ -745,10 +749,10 @@ Only image-related config lives at `customization.image_ratio`:
 | Value | Aspect ratio |
 |---|---|
 | `1` | 1:1 (square) |
-| `2` | 4:3 |
-| `3` | 16:9 |
+| `2` | 4:5 (portrait) |
+| `3` | 9:16 (portrait) |
 
-This is a **display aspect ratio only** — the storefront crops uploaded images to it at render time, but the file stored on S3 is the full-frame WebP (see "Image upload" above for the auto-conversion). There is no store-level dimension, size, or MIME setting; `image_ratio` is the entire image-related config surface. If you want the storefront cards to look right, either (a) pre-crop the source image to that ratio before uploading, or (b) accept that off-center subjects will get chopped by the render-time crop.
+This is the **crop ratio for new uploads** — the dashboard's cropper uses it. The storefront never reads it: product cards show each photo at its own shape, so a photo uploaded uncropped makes its card a different size. There is no store-level dimension, size, or MIME setting; `image_ratio` is the entire image-related config surface. For uniform cards, pre-crop the source image to that ratio before uploading.
 
 ```
 curl -s "https://api.blanxer.com/store/$STORE_ID" \

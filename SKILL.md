@@ -50,8 +50,8 @@ Ask for whichever of these are relevant to what they picked, and only then:
 - **Tags.** Optional, but ask once — a store that uses seller/facet tags wants them set at create time, not back-filled. Accept a whole-run list (`BLANXER_TAGS`) or a per-row `tags` column. Full vocabulary and semantics in "Product tags" below.
 - **Images (Website / All channels only).** For POS-only uploads, skip. For Web/All:
   - Ask whether the user has images ready (folder path? one image per row? URLs in a column?).
-  - Fetch `customization.image_ratio` via `GET /store/{store_id}` and translate: `1`=1:1 square, `2`=4:3, `3`=16:9.
-  - **Ask upfront: crop yourself (agent) or user pre-crops?** The storefront crops at render time to the store's `image_ratio` — off-center subjects will get chopped. Options:
+  - Fetch `customization.image_ratio` via `GET /store/{store_id}` and translate: `1`=1:1 square, `2`=4:5 portrait, `3`=9:16 portrait (the dashboard's labels and its photo cropper; older notes that said 4:3 / 16:9 were wrong and cropped photos landscape).
+  - **Ask upfront: crop yourself (agent) or user pre-crops?** The storefront shows each photo at its own shape (it never reads `image_ratio`); the dashboard crops new uploads to that ratio, which is what keeps product cards uniform. A photo uploaded uncropped makes its card a different height. Options:
     - User pre-crops → just upload as-is.
     - Agent auto-crops → use `sips`, Pillow (`ImageOps.fit`), or ImageMagick to center-crop to the target ratio before uploading. Confirm the ratio before batch-processing.
   - **Don't pre-convert format.** Server auto-converts raster images (JPG/PNG/HEIC) to **WebP quality 95** via sharp on upload; the returned `file_url` will end in `.webp`. SVG passes through unchanged.
@@ -70,16 +70,17 @@ When the source is a spreadsheet full of external image URLs (Daraz-style `stati
 
 1. **Download** the source URL to a temp file. Send a browser `User-Agent` (marketplace CDNs sometimes 403 plain urllib).
 2. **Auto-trim dark background** so the product isn't dwarfed by studio backdrop. Marketplace studio shots frequently have 15–40% black/dark-gray padding on the sides (e.g. bag photos with a black-on-black backdrop). Use a brightness-threshold bbox trim (Pillow snippet below). Skip if the source is already a clean lifestyle shot.
-3. **Center-crop to the store's `image_ratio`** using `ImageOps.fit`. Ratios: `1`→`(1,1)`, `2`→`(4,3)`, `3`→`(16,9)`. Resize the long edge to ~1200–1600 px.
-4. **Upload** each cropped file to `POST /product/{store_id}/file` (multipart, `upload_purpose=product_image`). Response is `{file: {file_url: "https://cdn2.blanxer.com/uploads/<store_id>/product_image-<name>-<nnnn>.webp", ...}}` — server auto-converts to WebP q95.
-5. **Create the product** with `image_urls: [<file_url1>, <file_url2>, ...]` in the order you want them shown. First URL is the thumbnail.
+3. **Center-crop to the store's `image_ratio`** using `ImageOps.fit`. Ratios: `1`→`(1,1)`, `2`→`(4,5)`, `3`→`(9,16)`. Resize the long edge to ~1200–1600 px.
+4. **Already uploaded?** Before uploading, look the photo up: `GET /file/{store_id}/images?source_hash=<sha-256 hex of the original file, before cropping>` (or `?q=<part of the file name>`). A hit's `items[0].file_url` goes straight into `image_urls`; don't upload a copy. Older backends answer this route with an error: just upload.
+5. **Upload** each cropped file to `POST /product/{store_id}/file` (multipart, `upload_purpose=product_image`, plus `source_hash=<that sha-256>` so it's found next time). Response is `{file: {file_url: "https://cdn2.blanxer.com/uploads/<store_id>/product_image-<name>-<nnnn>.webp", ...}}` — server auto-converts to WebP q95.
+6. **Create the product** with `image_urls: [<file_url1>, <file_url2>, ...]` in the order you want them shown. First URL is the thumbnail.
 
 **Pillow helper — dark-background trim + ratio crop:**
 
 ```python
 from PIL import Image, ImageOps, ImageChops, ImageStat
 
-RATIO_MAP = {1: (1,1), 2: (4,3), 3: (16,9)}
+RATIO_MAP = {1: (1,1), 2: (4,5), 3: (9,16)}  # 2 and 3 are PORTRAIT
 
 def trim_dark_bg(im, threshold=25):
     """Trim near-black borders. threshold=25 catches studio black + dark gray backdrops.
@@ -345,13 +346,13 @@ Skip if `channel == 3` (POS-only). For Website (`2`) or All (`1`):
 ```
 POST /product/{store_id}/file            (multipart, CF browser headers)
 Content-Type: multipart/form-data
-Fields: file=<image binary>, upload_purpose=product_image
+Fields: file=<image binary>, upload_purpose=product_image, source_hash=<sha-256 hex of the original photo> (optional)
 ```
 
 Response includes `file.file_url` — an S3 URL. Collect these per product; the **first URL becomes the primary/thumbnail** in `image_urls[]`, so order matters.
 
 - **Cropping**: before uploading, decide the per-image approach (already agreed in prerequisites step 7). If auto-cropping, use `sips -c <H> <W> <input> --out <output>` for square (macOS) or Pillow (`ImageOps.fit(img, (w, h))`) for arbitrary ratios. Feed the cropped file to the upload, not the original.
-- **Fail-soft**: if one image fails, keep the URLs that succeeded and continue to product create rather than aborting the whole row. Log the row/filename so the user can retry manually via `POST /product/{store_id}/{product_id}/file` on the created product.
+- **Fail-soft**: if one image fails, keep the URLs that succeeded and continue to product create rather than aborting the whole row. Log the row/filename so the user can retry: upload again through `POST /product/{store_id}/file` and add the URL to the product's `image_urls` with the general-info edit. **Never use `POST /product/{store_id}/{product_id}/file`**: that is the storefront's public route for customer uploads (saved as a customer upload, hidden from Media, and not attached to the product).
 - **Parallelism**: image uploads are the slow part. If you're batching 40+ products with images, upload in parallel (5–10 at a time) — the create step below is still sequential.
 
 For POS-only channel this step is entirely skipped; product cards in the POS UI work off name/barcode alone.
@@ -845,7 +846,7 @@ Authorization: Bearer <token>
 
 For non-premium stores also disable any suggestions of `bulk_add`, SMS blasts, or Excel exports later in the flow — they'll all `not_allowed` regardless.
 
-**Known store reference** (as of 2026-07-20): Example Store (`507f1f77bcf86cd799439011`) is on **platinum** — unlimited products, 2.75% Blanxer-Pay charge, 50 staff cap. Advanced inventory is ON. `image_ratio` is `2` (4:3). Skip this preflight for Example Store uploads unless the plan might have changed — but still worth a quick check if the batch is huge.
+**Known store reference** (as of 2026-07-20): Example Store (`507f1f77bcf86cd799439011`) is on **platinum** — unlimited products, 2.75% Blanxer-Pay charge, 50 staff cap. Advanced inventory is ON. `image_ratio` is `2` (4:5 portrait). Skip this preflight for Example Store uploads unless the plan might have changed — but still worth a quick check if the batch is huge.
 
 **⚠ Advanced-inventory detection — plan-first gate, then flags:**
 
