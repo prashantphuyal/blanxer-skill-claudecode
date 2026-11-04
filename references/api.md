@@ -1470,6 +1470,8 @@ gift          { trigger {basis amount|products, min_amount, scope?, min_qty}, it
 display       { public, badge (≤30), top_bar, offers_page, countdown, promo_link }
 ```
 
+**Bundle offers are sold as a product** (`bundle.product_id`). That product keeps no stock of its own: its stock is the sets the items make (never stock it in). A price changed on that product (Edit Price & Inventory, bulk update / edit) and a name, short description or photos changed in Edit General Information become the offer's too (from 2026-11-04). A generated set photo (`POST /promotion/{store}/bundle-image`) is made in the store's product photo shape (`customization.image_ratio`: 1 = square, 2 = 4:5, 3 = 9:16); crop an uploaded `image_url` to the same shape.
+
 - Fill the block named by `kind` (`'Fill in what the customer gets'` otherwise). Percentages ≤ 100.
 - `amount_off` with scope `all` is an **order** offer; any other kind/scope is a **product** offer; `free_delivery` is a **delivery** offer.
 - `combines` defaults (the dashboard's): product offers `{product:true, order:true, delivery:true}`; order offers and codes `{product:true, order:false, delivery:true}`; delivery offers `{product:true, order:true, delivery:false}`. Two offers combine only when both allow it.
