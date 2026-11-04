@@ -929,6 +929,8 @@ It flags batches at cost 0 (any date) or at the selling price (−3% / +5%, rece
 
 When the source (notebook, count) says an already-uploaded product's quantity should change, DON'T re-create the product. Adjust the batch ledger instead.
 
+**Bundles keep no stock of their own** (a product with `bundle.items`, incl. a bundle offer's product). What a bundle can sell is the fewest full sets its items make; every read gives that number (product page `bundle.sets`, lists, `GET /product/{store}/{id}`, the website stock check). Never stock in, write off or count-correct a bundle: change its items' stock. Blanxer refuses a stock-in on a bundle ("is a bundle: it has no stock of its own", backend from 2026-11-04). A price, name, short description or photo changed on a bundle offer's product becomes the offer's too.
+
 **Every stock move takes a `client_request_id`** (stock-in, bulk stock-in, write-off, transfer-stock, adjust-batch; backend from 2026-10-18). Make one per intended move and **reuse it when you retry after a timeout**: the backend applies it once and answers the retry from the first one. A new move gets a new id. (The older backend ignores the field, so a retry there doubles the stock: check `/inventory/list` before retrying.) Quantities are whole numbers.
 
 - **Decrease** (e.g. notebook says "-1"): fetch `batch_id` via `GET /inventory/batch/{store_id}?product={id}&outlet={outlet_id}&hasStock=true`, then `POST /inventory/write-off` with `subtype: "COUNT_CORRECTION"` and `{batch_id, quantity: n}`.
