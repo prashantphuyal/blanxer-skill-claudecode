@@ -97,7 +97,7 @@ Returns the list of outlets configured for the store. Use this to resolve a huma
 - `inventory_roles` — the current user's inventory permissions. `stock_in` must be present for the second POST to succeed.
 - `isOwner` — shortcut; if `true`, `allowed` == `outlets` (plus the synthetic all-outlets entry).
 
-There are no geo-coordinates on an outlet — `outlet.ts` stores name/address/contact/status only. Don't expect `lat`/`lng`.
+There are no geo-coordinates on an outlet — `outlet.ts` stores name/address/contact/status (plus `courier_pickup` from store pickup, and, from the multi-outlet release, `city`, `online_buffer`, `delivery_charge` and `courier_bindings`: see "Pooled stock" under Orders). Don't expect `lat`/`lng`.
 
 **Related outlet-management endpoints** (same router, not used by the upload flow):
 - `POST /inventory/create-outlet`
@@ -244,7 +244,7 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 **Inventory / outlets**
 
 - `GET /inventory/outlets/{store_id}` — list outlets + `allowed` scope + `inventory_roles` + `isOwner`.
-- `POST /inventory/create-outlet` — needs `create_outlet` role.
+- `POST /inventory/create-outlet` — needs `create_outlet` role. **Outlet limit (multi-outlet release):** a per-store limit set by Blanxer super admin (`store.limits.outlet_limit`, default 3), counted over **all** outlets, active or not. Over it: 400 `{ message: "Your plan allows 3 outlets. Contact Blanxer support to add more.", error_code: "OUTLET_LIMIT", limit, count }`. Existing outlets are kept; only creating more is blocked. The old `key` body field is dropped (sending it does nothing). Don't retry: tell the user to ask Blanxer support.
 - `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum or POS plan** (`canUsePos`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
   ```
   { "name": "Main Branch", "address": "...", "contact_name": "...", "contact_number": "...", "status": "active" }
@@ -256,7 +256,7 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 - `POST /inventory/write-off` — damage / loss. Takes `client_request_id`. A write-off of more than a batch holds is refused and nothing in the request moves.
 - `POST /inventory/adjust-batch` — **raise one existing batch's on-hand in place** (count correction), instead of spawning a new batch. Body `{store_id, outlet_id, batch_id, quantity (≥1), subtype: "COUNT_CORRECTION"|"SYSTEM_FIX", reference_number?}`. Needs the `stock_in` inventory role. Transactional; writes the ledger + movement log. Decreases still go through `/write-off`. Takes `client_request_id`.
 - `POST /inventory/update-batch` — edit a batch's **descriptive** fields only: `{store_id, outlet_id, batch_id, mfg_date?, expiry_date?, bin_location?}`, each `null` to clear, omitted to leave alone. Never quantity (that would let Batch / StockLedger / Product counters diverge) and never `batch_code` (it's the supplier's lot id). Writes no ledger row, needs no transaction. `outlet_id` is both the role scope and a re-check against the batch, so a caller can't edit a batch in an outlet they don't hold.
-- `POST /inventory/update-outlet` — needs `update_outlet` role.
+- `POST /inventory/update-outlet` — needs `update_outlet` role. Multi-outlet release adds optional `city` (must be a store delivery place, else 400 `OUTLET_CITY_INVALID`), `online_buffer` (int 0..9999) and `courier_bindings` (whole array replaced). See "Pooled stock".
 - `POST /inventory/change-website-outlet` — repoint `store.website_outlet`; needs `update_outlet`.
 - `GET /inventory/list/{store_id}?outlet=<id>` — current on-hand per outlet. Shows every product ever stocked at the outlet, **zero-stock rows included**. Filters: `page`, `per_page` (≤100), `product_id`, `variant_id`, `category`, `q` (product name or SKU, product or variant), `movement=dead|fast`, `stock_status=IN_STOCK|LOW_IN_STOCK|OUT_OF_STOCK` (applied to the summed stock after grouping), `sort=recent|stock_asc|stock_desc|value_desc|sold_recent|sold_oldest` (`sold_oldest` puts never-sold stock first).
 - `GET /inventory/summary/{store_id}` — overview cards, built from the same thresholds as the list so the counts always agree. Returns `total_value`, `total_cost`, `total_skus`, `total_qty`, `stock_health{out_of_stock, low_stock, dead_stock, dead_stock_cost}`, `stock_movement{fast_moving, expiring_soon, expired}`, `top_value[]`, `slow_stock[]`, `write_offs{days, items, cost, by_reason[]}`, `value_trend[]`, `thresholds{…}`, `updated_at`.
@@ -1162,6 +1162,7 @@ Editable only when `status ∈ {Draft, Pending, Processing}` and `payment_status
 - `payment_method` is **rejected if a gateway Transaction already exists** for the order (you can't overwrite gateway records).
 - Moving into `Cancelled`/`Returned` restores inventory; moving out re-reduces it.
 - `Dispatched`/`Delivered` also set `dispatched_at`/`delivered_at`, fire SMS + delivered email.
+- Multi-outlet release: optional `group_scope: 'order'|'group'` cancels one parcel or every parcel of a split checkout (see "Pooled stock").
 
 ### Enums (order-level, stored as strings)
 
@@ -1198,6 +1199,8 @@ GET /order/:store_id?from=<ISO>&to=<ISO>&status=<exact>&query=<text>&label=<labe
 ```
 
 `query` (full-text search) overrides the date range. Empty `status` excludes `Inactive`.
+
+Multi-outlet release (paged mode): `split`, `checkout_group`, `outlet`, `to_pack` filters, and `checkout_group` / `linked_orders` on the detail (see "Pooled stock").
 
 **Paged mode (added 2026-10, `get-store-orders.ts`).** Send `page` and the handler switches to a paged query; omit it and the response is byte-for-byte the legacy full list, so nothing existing breaks.
 
@@ -1306,6 +1309,98 @@ Platinum stores on advanced inventory with 2+ active outlets can let website sho
 - **Courier submits** on a pickup answer `409 needs_confirmation {code: 'PICKUP_ORDER'}`; resend with `confirm: ['PICKUP_ORDER']` only after the user says yes.
 - **Move the fulfilling outlet:** `POST /order/:store_id/:order_id/fulfil-from` `{outlet}` (staff; only before it is sent, not a counter sale, no courier booking). Stock moves with it.
 - Setting: `GET/POST /store/:store_id/checkout/fulfilment` (owner/manager) — `{pickup_enabled, pickup_outlets, choose_outlet, pickup_pay_at_store, pickup_advance {enabled, basis: fixed|percent, amount, percent}}`.
+
+### Pooled stock: selling online from several outlets (multi-outlet release, backend `feat/multi-outlet-pool`, not on `origin/dev` yet)
+
+Contract: `plans/multi-outlet/api-contract.md`. A store is **pooled** when `store.checkout.fulfilment.online_stock === 'pooled'` and it is still eligible. **Every new path checks that first; on any other store the old code runs and the output is identical.** New body fields and query params are optional; new response fields are additive.
+
+**Eligibility** (all of): Blanxer super admin allowed it (`store.limits.pooled_allowed`), Platinum + advanced inventory with a website outlet (same as store pickup), and at least 2 pool outlets with `ships_online` (active, a `city`, and a courier binding / `courier_pickup`, or no courier plugin at all = own delivery). An outlet that can't ship can stay in the pool: it is skipped for delivery and still counts for pickup.
+
+**Setting** — `GET /store/:store_id/checkout/fulfilment` (staff) / `POST` (owner, manager). The payload gains:
+
+```jsonc
+"fulfilment": { /* pickup fields */, "online_stock": "pooled", "pool_outlets": ["65a…01","65a…02"],
+                "website_display": { "stock": "combined", "show_stores": false } },
+"pool": { "allowed": true, "eligible": true, "blockers": [], "warnings": ["Map Butwal to a Tigg location …"],
+          "outlet_checks": [ { "_id": "…", "name": "Butwal", "city": "Butwal", "online_buffer": 1, "active": true,
+                               "in_pool": true, "ships_online": true, "problems": [] } ] },
+"limits": { "outlet_limit": 12, "outlet_count": 9 }
+```
+
+- POST body = today's plus any of `online_stock`, `pool_outlets` (ordered; the order is the routing tie-break), `website_display`. **A field left out keeps its saved value** (the endpoint now merges).
+- Refusals, 400 `{ message, error_code }`: `POOL_NOT_ALLOWED` (support hasn't allowed it), `POOL_BLOCKED` (message = the blockers), `DISPLAY_NEEDS_POOL` (`stock: 'combined'` while not pooled). Turning pooled off always works and resets the display to `website_outlet`.
+- This is the owner's dashboard setting (Setting → Checkout → Store pickup & fulfilment). Don't switch pooled on or off, or change the pool, without the user's explicit yes.
+
+**Outlet fields** (`POST /inventory/update-outlet`): `city` (a store delivery place; 400 `OUTLET_CITY_INVALID` otherwise), `online_buffer` (units never offered online, default 0), `courier_bindings: [{ courier: 'pathao'|'ncm'|'pickndrop'|'hello', account: 'default', pickup_ref, is_default }]` (whole array replaced; a pathao / ncm binding also writes `courier_pickup`). `GET /inventory/outlets/:store_id` returns them.
+
+**Delivery charge per outlet** (read: staff; write: owner/manager, and only with `pooled_allowed` + Platinum + advanced, else 403 `POOL_NOT_ALLOWED`). `outlet.delivery_charge = { mode: 'store'|'store_plus'|'own'|'free', adjust?: { basis: 'amount'|'percent', value }, overrides?: { defaults: (number|null)[6], places: { [place]: (number|null)[6] } } }`. `store_plus` = store charge + amount or percent (never below 0); `own` = cells on top of the store's matrix (`null` = the store's cell, `-1` = this outlet's default); `free` = 0. COD per place stays store-wide. While the store isn't pooled, saved outlet rates are ignored.
+
+| Method & path | Body | Response |
+|---|---|---|
+| `GET /store/:store_id/outlet/:outlet_id/delivery-charge` | — | `{ outlet, delivery_charge, store_table, effective: {defaults, places}, changed_cells, changed_places, label }` |
+| `PUT /store/:store_id/outlet/:outlet_id/delivery-charge` | `{ mode, adjust?, overrides? }` (unknown place → 400 `UNKNOWN_PLACE`) | same as GET |
+| `GET /store/:store_id/outlet-delivery` | — | `{ outlets: [{ _id, name, in_pool, mode, label, changed_cells, changed_places }] }` |
+| `POST /store/:store_id/outlet-delivery/copy` | `{ from: 'store' \| outletId, to: outletId[] (1..50), replace }` | `{ updated: outletId[] }`; with `replace: false` and a target that has its own setup: 409 `needs_confirmation { code: 'REPLACE_OUTLET_RATES' }` (resend `replace: true` after the user's yes) |
+| `GET /store/:store_id/outlet-delivery/compare?band=0..5` | — | `{ band, outlets, rows: [{ place, store, charges: {[outletId]: n}, differs }] }` |
+
+Labels: "Same as store", "Store +Rs 50", "Store +20%", "Own rates · 12 cities changed", "Free".
+
+**Routing** (which outlet ships to a place): `GET /store/:store_id/fulfilment/routing` (staff) → `{ rows: [{ place, outlets: [{_id, name}], source: 'auto'|'edited' }] }`; `PUT` (owner/manager) `{ rows: [{ place, outlets: outletId[] }] }` (pool outlets only: 400 `ROUTING_OUTLET_NOT_IN_POOL`; unknown place: 400 `UNKNOWN_PLACE`); `POST …/routing/reset { places? }`. Only edited rows are stored; the rest is worked out live (outlet in that city, then same province, then the rest, ties in `pool_outlets` order).
+
+**Stock.** Pooled website stock = Σ over pool outlets that are active and ship of `max(0, stock_on_hand − online_buffer)`. With `website_display.stock: 'combined'` product reads show that number; with `'website_outlet'` they show the website outlet's minus its buffer. Checkout checks (stock check, holds, payment start, create) always use the pooled number. Holds are counted against the pool.
+
+**Staff checkout plan** — `POST /order/:store_id/checkout-plan` (owner/manager/csr). Body:
+
+```jsonc
+{ "products": [ { "product": "…", "variant": "", "quantity": 2 }, { "product": "", "name": "Gift wrap", "price": 150, "quantity": 1 } ],
+  "place": "Pokhara", "payment": "cod", "fulfilment": "delivery", "pickup_outlet": null,
+  "code": "", "coupon": "", "gift_choices": {}, "removed_offers": [], "phone": "",
+  "customer_id": "…", "override_delivery_charge": -1, "outlet": null }
+```
+
+- Custom lines go on parcel 1 (weight 0). `outlet` forces one parcel from that outlet (`chosen_by: 'staff'`); a short line is 400 `stock_error OUT_OF_STOCK` naming the outlet.
+- Response `{ success, data }`, `data` = `{ plan_id (30 min), expires_at, pooled, split, place, cod_available, parcels: [{ index, outlet: {_id, name, city}, lines, weight, goods, customization, discount, delivery_base, delivery, total, advance, cod_to_collect }], totals, delivery_label, offers, advance, payable: { total } }`.
+- It replaces client-side delivery maths on a pooled store: never compute a pooled store's delivery from the matrix.
+
+**Create** — `POST /order/create/:store_id` and `/order/create-lead/:store_id` take `checkout_plan_id?` and `outlet?`:
+
+- Valid plan → the quoted delivery is final (if routing changed meanwhile, the plan's total delivery is shared over the new parcels and the answer has `plan_changed: true`). Expired / unknown / mismatched plan → 409 `{ message, error_code: 'CHECKOUT_PLAN_STALE', plan }`: show the user the fresh plan and resend with `plan.plan_id` only after their yes. No plan id → the server works one out.
+- `override_delivery_charge ≥ 0` is the whole checkout's delivery, put on parcel 1 (others 0).
+- Payment on a split: `Paid` → every order Paid; `Partial` → `partial_payment_amount` shared by order total (remainder on parcel 1); one `PosBankTxn` with `orders[]` when an account is given.
+- `client_request_id` is idempotent for the whole group (a repeat returns the same group).
+- Response `{ status: 'success', _id, order_number /* parcel 1 */, checkout_group, orders: [{ _id, order_number, index, outlet: {_id, name}, total, delivery_charge, advance_due, amount_to_pay, status }] }`.
+- `POST /order/sambad/create` is routed and split server-side (no plan); its response adds `checkout_group` and `orders`.
+
+**Order fields** (null / absent on older orders): `checkout_group { id, index (1-based), count, reason: 'outlet' }` (`count` stays the original after a cancel) and `fulfilment { type, outlet, outlet_name, chosen_by: 'auto'|'staff'|'shopper' }` (pooled delivery orders get `type: 'delivery'`, `chosen_by: 'auto'`; Fulfil from sets `'staff'`). Each order keeps its own share in the usual fields: `delivery_charge`, `delivery_charge_before_promo`, `discount.d_value`, `advance.due`. The coupon / offer claim sits on parcel 1 only. Activity `fulfilment_routed` reads "Fulfilled by Pokhara (auto)".
+
+- **List** `GET /order/:store_id` (paged) new params: `split=1` (`checkout_group.count > 1`), `checkout_group=<id>`, `outlet=<outletId>|mine` (the fulfilling outlet; `mine` = the user's `inventory_outlets`; a filter, not access control), `to_pack=1` (online, Pending/Processing, no courier booking, stock taken; pickups included). Rows add `checkout_group`.
+- **Detail** `GET /order/:store_id/:order_id` adds `checkout_group` and `linked_orders: [{ _id, order_number, index, outlet: {_id, name}, status, payment_status, total, delivery_charge, logistics_status }]`.
+- **Cancel one or all** — `POST /order/:store_id/:order_id/status` takes `group_scope: 'order'|'group'` (default `'order'`). `'group'` only with `status: 'Cancelled'` (else 400 `GROUP_SCOPE_CANCEL_ONLY`); it cancels every order of the group with no courier booking, each with its own full refundable (`refund.amount` ignored; `refund.paid_from` / `reason` apply to all), skips sent ones, and adds `group_results: [{ order_id, order_number, ok, skipped_reason?, message? }]`. Bulk status stays per order.
+
+**One online payment for a group** (website). The shopper pays the group once; the group `Transaction` has `kind: 'group'`, `order: null`, `checkout_group`, `orders: [{ order, transaction, amount }]`, and one child transaction (`kind` absent / `'order'`, `parent` = the group) per order with a share above 0. `order.transaction` points at the order's own child. A `kind: 'group'` transaction has no `order`: for anything per order, use the children. Each order stores its own share (`Paid`, or `Partial` with `partial_payment_amount` = its share), so a refund of one parcel returns only that order's share. Reconcile gets one deposit for the group, rows per order.
+
+**Holds across the pool.** On a pooled store a sale, write-off, transfer out or stock edit at outlet X asks when `pooledStock − unitsLeavingX < pooledHeld`. Same 409 as on any store, with extra fields on each line:
+
+```jsonc
+{ "message": "2 of Kurta (M) are held in website checkouts right now (5 online across stores). Sell anyway?",
+  "needs_confirmation": { "code": "HELD_IN_CHECKOUTS", "action": "Sell anyway", "details": { "lines": [
+    { "product_id": "…", "variant_id": "…", "name": "Kurta", "variant_name": "M", "wanted": 3,
+      "in_stock": 5, "held": 2, "pooled": true, "outlet": "65a…03", "outlet_stock": 3 } ] } } }
+```
+
+`in_stock` / `held` are the pool's when `pooled: true`. Resend with `confirm: ['HELD_IN_CHECKOUTS']` only after the user says yes (POS sale, admin create, lead, Sambad, status, write-off, transfer, stock save all take it).
+
+- `GET /inventory/pos-list/:store_id?outlet=X` items gain `held_online` (only when pooled and X is in the pool): `min(availHere, max(0, pooledHeld − (pooledStock − availHere)))`, `availHere = max(0, stock_X − buffer_X)`. Selling more than `availHere − held_online` asks.
+- Light read: `POST /inventory/held-online/:store_id` (staff) `{ outlet, lines: [{ product, variant }] (≤200) }` → `{ success, pooled, lines: [{ product, variant, available_here, held_online }] }`.
+
+**Between locations record (`FulfilmentEntry`)** — read-only, **only on pooled stores**. One entry when an order's stock is taken at an outlet (`fulfilled_by`) other than where the money was received (`received_by`: `online` = website payment, advance or COD settled to the store, located at the website outlet; or `outlet` = the pickup outlet when paid there). A reversal (negative values) on cancel, return or a refund with goods back; Fulfil from = a reversal at the old outlet + a new sale at the new one; an exchange's replacement order gets its own entry. No entry for a pickup paid at the same outlet. Fields: `order`, `order_number`, `checkout_group`, `kind: 'sale'|'reversal'`, `reason: 'placed'|'cancelled'|'returned'|'refund_goods'|'moved'|'exchange'`, `reverses`, `fulfilled_by`, `received_by {kind, outlet}`, `advance_online`, `lines [{product, variant, name, variant_name, qty, unit_price, unit_cost}]`, `units`, `goods_value` (after discount share), `cost_value` (batch COGS), `delivery_charge`, `at`. **There is no settled / open status and no settle action**; nothing is posted to the books. The courier fee is read live from `order.courier_fee`.
+
+- `GET /omni-analytics/between-locations/:store_id?from&to&location?&received_by?=online|<outletId>&page=1&per_page=50` (owner/manager + analytics scope) → `{ range, locations: [{ outlet, sent {orders, units, value, cost}, returned {…}, delivery_charges, courier_fees, net {units, value, cost} }], matrix: { receivers, senders, cells: [{ received_by, fulfilled_by, orders, value, cost }] }, entries: { page, per_page, total, rows: [{ _id, at, order {_id, order_number}, checkout_group, kind, reason, fulfilled_by {_id, name}, received_by, units, goods_value, cost_value, delivery_charge, courier_fee }] } }`.
+- Export: `POST /reports/:store_id { type: 'between_locations', format: 'csv'|'xlsx', from, to, locations?, options: { received_by? } }`. Columns: Date, Order, Checkout, Kind, Reason, Sent from, Received by, Units, Selling value (Rs), Cost (Rs), Delivery (Rs), Courier fee (Rs).
+
+**Shipped for online** (any advanced store, read-only): `GET /omni-analytics/shipped-for-online/:store_id?from&to&outlet?` (owner/manager + analytics scope) → `{ rows: [{ outlet, orders, units, sales_value, cost_value, returns {orders, units, value, cost}, net_units, net_value, avg_hours_to_courier }] }`: online orders (pickups included) whose stock was taken at an outlet other than the website outlet, dated by when the stock was taken. Report type `shipped_for_online` in `POST /reports`. Sales totals elsewhere don't change (the place stays Online).
+
+**Movement label:** on pooled stores the SALE movement of an online order taken at a non-website outlet has `stock_movement_logs.subtype: 'ONLINE_FULFILLED'` (in `GET /inventory/stock-movement-logs/:store_id` and `recent[].subtype` of `GET /inventory/product/:store_id/:product_id`). Show it as "Online order (fulfilled here)" with the order link.
 
 ### Admin create lead — `POST /create-lead/:store_id`
 
