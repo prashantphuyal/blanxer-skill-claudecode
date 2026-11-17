@@ -853,15 +853,15 @@ For non-premium stores also disable any suggestions of `bulk_add`, SMS blasts, o
 ```python
 plan = (store.get("plan") or "").lower()
 is_advanced_inventory = (
-    plan in {"plus", "platinum", "elite", "pos"}
+    plan in {"platinum", "elite", "pos"}
     and store.get("use_advanced_inventory") is True
     and bool(store.get("website_outlet"))
 )
 ```
 
-**The rule is the backend's: advanced = `use_advanced_inventory === true` AND `website_outlet` set** (every checkout, POS and stock path uses exactly this). Advanced inventory can be turned on for **Business Plus, Platinum, Elite and POS** plans (`planIncludes(plan, 'advanced_inventory')`); a store with the flag but no `website_outlet` is half-migrated: treat it as non-advanced. The plan check in the snippet above is a safety net for data drift on other plans, not the rule.
+**The rule is the backend's: advanced = `use_advanced_inventory === true` AND `website_outlet` set** (every checkout, POS and stock path uses exactly this). Advanced inventory can be turned on for **Platinum, Elite and POS** plans (`planIncludes(plan, 'advanced_inventory')`); a store with the flag but no `website_outlet` is half-migrated: treat it as non-advanced. The plan check in the snippet above is a safety net for data drift on other plans, not the rule.
 
-**⚠ Never auto-run `POST /inventory/enable`.** Business Plus, Platinum, Elite or POS plan, NOT bodyless (outlet fields), and **one-way**: it seeds `OPENING_BALANCE` batches from current quantities and sets `website_outlet`. Two BETA stores are blocked. From 2026-10-18 it can be retried after a failure, reuses a store's single existing outlet (POS-signup stores), counts stock already in batches only once, and sets every total from the batches. If the user asks for it, hand them the payload and confirm the outlet fields; never fire it as a side-effect of an upload.
+**⚠ Never auto-run `POST /inventory/enable`.** Platinum, Elite or POS plan, NOT bodyless (outlet fields), and **one-way**: it seeds `OPENING_BALANCE` batches from current quantities and sets `website_outlet`. Two BETA stores are blocked. From 2026-10-18 it can be retried after a failure, reuses a store's single existing outlet (POS-signup stores), counts stock already in batches only once, and sets every total from the batches. If the user asks for it, hand them the payload and confirm the outlet fields; never fire it as a side-effect of an upload.
 
 **Branch on the two flows:**
 

@@ -245,7 +245,7 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 
 - `GET /inventory/outlets/{store_id}` — list outlets + `allowed` scope + `inventory_roles` + `isOwner`.
 - `POST /inventory/create-outlet` — needs `create_outlet` role.
-- `POST /inventory/enable` — flip store into advanced-inventory mode. **Business Plus, Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
+- `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
   ```
   { "name": "Main Branch", "address": "...", "contact_name": "...", "contact_number": "...", "status": "active" }
   ```
@@ -331,18 +331,17 @@ Two gates read this list:
 - `isPremiumStore(plan)` = a **website plan**: `basic`, `premium`, `plus`, `platinum`, `elite`. **Not `pos`.**
 - `isPremiumOrPos(plan)` / `checkPremiumOrPos()` = any of the 6 paid codes.
 
-**`plan_info`.** `GET /store/mine` (on every store) and `check_domain` return `plan_info`: `{ plan, name, active, legacy, on_sale, qr_fee, ai_level, features: { website, online_payments, ai_agent, analytics_full, advanced_inventory, store_pickup, pos, multi_branch, multi_warehouse, customer_login, loyalty, premium_sections, accounting, e_billing } }`. Read `plan_info.features.<name>` and fall back to the plan id lists here only when `plan_info` is absent (older backend). `legacy: true` = a store created before the new pricing: it keeps everything its plan could do before, and `features` already says so.
+**`plan_info`.** `GET /store/mine` (on every store) and `check_domain` return `plan_info`: `{ plan, name, active, legacy, on_sale, qr_fee, ai_level, features: { website, online_payments, ai_agent, analytics_full, advanced_inventory, store_pickup, pos, multi_branch, multi_warehouse, customer_login, loyalty, premium_sections, e_billing } }`. Read `plan_info.features.<name>` and fall back to the plan id lists here only when `plan_info` is absent (older backend). `legacy: true` = a store created before the new pricing: it keeps everything its plan could do before, and `features` already says so.
 
 What the plans include:
 
 | Feature | Plans |
 |---|---|
 | Online payment methods on the storefront | every website plan (`basic`, `premium`, `plus`, `platinum`, `elite`). `pos` and free stores are Cash on Delivery only |
-| Advanced inventory | Business Plus, Platinum, Elite, POS |
-| Store pickup / fulfil from | Business Plus, Platinum, Elite (with advanced inventory) |
+| Advanced inventory | Platinum, Elite, POS |
+| Store pickup / fulfil from | Platinum, Elite (with advanced inventory) |
 | POS | Platinum, Elite, POS |
 | Multi-warehouse (pooled) fulfilment | Platinum, Elite, and only when Blanxer has switched it on for the store |
-| Accounting | Elite (stores from before the new pricing keep it) |
 
 **"Non-premium" = empty / undefined `.plan`** (free tier, lapsed subscription, or trial without a paid plan attached). NOT "basic-tier" — `basic` is a paid plan and counts as premium for these gates. A `pos` store is paid but not a website plan: it passes only the rows marked as open to `pos` below.
 
@@ -389,7 +388,7 @@ Blanxer-Pay service charge (`payment.service.ts:42`) — applied only to Blanxer
 
 **Plan-gated features that are easy to miss:**
 
-- **Advanced inventory** (`POST /inventory/enable`) — **Business Plus, Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). NOT toggleable on Basic, Premium or free stores. Also one-way + creates an outlet + migrates existing quantity into `OPENING_BALANCE` batches. See the `/inventory/enable` entry.
+- **Advanced inventory** (`POST /inventory/enable`) — **Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). NOT toggleable on Basic, Premium, Business Plus or free stores. Also one-way + creates an outlet + migrates existing quantity into `OPENING_BALANCE` batches. See the `/inventory/enable` entry.
 - Once a store is in advanced-inventory mode, `stock-in`, `write-off`, `transfer-stock`, `/inventory/list`, `/inventory/summary`, `/inventory/batch` all become the source of truth. Before advanced-inventory (or on any store that can't have it), these endpoints work but read from an empty Batch collection — stock lives directly on `product.quantity` / `variants[].quantity` instead.
 
 **Agent preflight logic for uploads:**
@@ -1321,7 +1320,7 @@ ip / user_agent: server-injected
 
 ### Store pickup (backend `claude/tsk-154`, not on `origin/dev` yet — rules in the backend's `docs/fulfilment-rules.md`)
 
-Business Plus, Platinum and Elite stores on advanced inventory with 2+ active outlets can let website shoppers collect an order at an outlet (Setting → Checkout → Store pickup & fulfilment).
+Platinum and Elite stores on advanced inventory with 2+ active outlets can let website shoppers collect an order at an outlet (Setting → Checkout → Store pickup & fulfilment).
 
 - **Storefront:** `check_domain` carries `store_pickup {outlets: [{_id, name, address, contact_number}], pay_at_store, advance}` (absent / empty = no pickup). The checkout sends `fulfilment: 'pickup'` + `pickup_outlet: <outlet _id>` on `POST /order/:store_id` and on the quote; `POST /order/public/pickup-stock` `{store_id, lines}` → per-outlet stock + a recommended outlet. No delivery charge; the address is still required. `paymentMethod: 'COD'` = **pay at the store** (refused when the store turned pay-at-store off; with a pickup advance it pays part online first like any advance order).
 - **The order:** `fulfilment {type: 'pickup', outlet, outlet_name}`, `order.outlet` = that outlet. Its stock comes from that outlet, and reports keep it a website (Online) sale under that outlet.
