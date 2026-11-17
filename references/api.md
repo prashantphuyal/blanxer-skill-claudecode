@@ -245,7 +245,7 @@ Any tag containing `:` is dropped before `search_key` is assembled. `key:value` 
 
 - `GET /inventory/outlets/{store_id}` — list outlets + `allowed` scope + `inventory_roles` + `isOwner`.
 - `POST /inventory/create-outlet` — needs `create_outlet` role.
-- `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum or POS plan** (`canUsePos`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
+- `POST /inventory/enable` — flip store into advanced-inventory mode. **Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). **NOT bodyless** — takes the outlet fields below. **One-way**: seeds `OPENING_BALANCE` batches from current `quantity` / `variants[].quantity`, sets `website_outlet`, `use_advanced_inventory=true` and (from 2026-10-18) `advanced_inventory_at`. Two high-volume store ids are blocked (BETA). From 2026-10-18 it reuses a store's single existing outlet instead of failing, can be retried, counts stock already in batches once, and works every total out from the batches; with several outlets and no website outlet it asks to pick one first. Body:
   ```
   { "name": "Main Branch", "address": "...", "contact_name": "...", "contact_number": "...", "status": "active" }
   ```
@@ -275,7 +275,7 @@ isAdvancedInventory = store.use_advanced_inventory === true  &&  !!store.website
 
 The flag alone is not enough. `website_outlet` is set as a side-effect of `POST /inventory/enable`, so a store with `use_advanced_inventory=true` but no `website_outlet` is in a broken/half-migrated state — treat as non-advanced.
 
-**Advanced-inventory path (Platinum + `website_outlet` present):**
+**Advanced-inventory path (`use_advanced_inventory` + `website_outlet` present):**
 
 - `POST /product/{store_id}` — `quantity` in body is forced to 0 and `inventory_summary` emptied.
 - Stock enters via `POST /inventory/stock-in` (creates a Batch, increments `inventory_summary.stock_on_hand` and `product.quantity`).
@@ -285,13 +285,13 @@ The flag alone is not enough. `website_outlet` is set as a side-effect of `POST 
 
 Flow:
 1. `POST /api-key/check` → `{token, store._id}`
-2. `GET /store/{store_id}` → confirm `plan === "platinum"` AND `use_advanced_inventory && website_outlet` (do NOT auto-run `/inventory/enable` — see its entry above)
+2. `GET /store/{store_id}` → confirm `use_advanced_inventory && website_outlet` (do NOT auto-run `/inventory/enable` — see its entry above)
 3. `GET /inventory/outlets/{store_id}` → pick `outlet_id`
 4. `POST /product/{store_id}` (quantity forced to 0)
 5. `POST /inventory/stock-in` with the outlet
 6. `GET /inventory/list/{store_id}` to verify
 
-**Non-advanced path (every non-Platinum store + Platinum stores that haven't enabled — the common case):**
+**Non-advanced path (every store that hasn't enabled advanced inventory — the common case):**
 
 - `POST /product/{store_id}` — `quantity` (and each `variants[].quantity`) is **applied directly**. Done. No outlets, no batches, no stock-in call needed.
 - Adjust stock later via `POST /product/variant_inventory/{store_id}/{product_id}` (`edit-product-variant-inventory.ts`) — sets the **absolute** root `quantity` and per-variant `quantity`. Owner/manager. This is the non-advanced equivalent of stock-in/write-off/adjust; it's a set-to-value, not a delta.
@@ -307,39 +307,59 @@ Flow:
 
 **Universal limits (every plan):** 500 variants / product, SKU uniqueness within store, advanced-inventory availability.
 
-**Non-premium-only cap:** 15 products total per store. Lifted by any of the 5 paid plans — see "Plan tiers and gates" below.
+**Non-premium-only cap:** 15 products total per store. Lifted by any of the 6 paid plans — see "Plan tiers and gates" below.
 
 **Cloudflare shielding:** mutating endpoints (POST/DELETE on product/inventory routes) require browser-like headers (`User-Agent`, `Origin`, `Referer`, `Accept*`) or return `403 error code: 1010`. See `SKILL.md` for the exact header set.
 
 ## Plan tiers and gates
 
-Read `.plan` from `GET /store/{store_id}`. `isPremiumStore(plan)` returns `true` if the plan is any of the 5 paid codes:
+Read `.plan` from `GET /store/{store_id}`. There are 6 paid codes (the one list is the backend's `src/core/constants/plans.ts`, rules in its `docs/plan-rules.md`):
 
-| Code (`store.plan`) | Display name |
+| Code (`store.plan`) | Display name | First year (NPR) | Renewal (NPR a year) | On the pricing page |
+|---|---|---|---|---|
+| `premium` | Premium | 28,000 | 16,800 | yes |
+| `plus` | Business Plus | 48,000 | 28,800 | yes |
+| `platinum` | Platinum | 78,000 | 46,800 | yes |
+| `elite` | Elite | 98,000 | 58,800 | yes |
+| `basic` | Basic | no longer sold | 14,400 | no: its stores keep it and can renew |
+| `pos` | POS | sales team only | 25,000 | no: POS only, no website (never quote it, see `SKILL.md`) |
+
+A renewal is 60% of the first-year price.
+
+Two gates read this list:
+
+- `isPremiumStore(plan)` = a **website plan**: `basic`, `premium`, `plus`, `platinum`, `elite`. **Not `pos`.**
+- `isPremiumOrPos(plan)` / `checkPremiumOrPos()` = any of the 6 paid codes.
+
+**`plan_info`.** `GET /store/mine` (on every store) and `check_domain` return `plan_info`: `{ plan, name, active, legacy, on_sale, qr_fee, ai_level, features: { website, online_payments, ai_agent, analytics_full, advanced_inventory, store_pickup, pos, multi_branch, multi_warehouse, customer_login, loyalty, premium_sections, e_billing } }`. Read `plan_info.features.<name>` and fall back to the plan id lists here only when `plan_info` is absent (older backend). `legacy: true` = a store created before the new pricing: it keeps everything its plan could do before, and `features` already says so.
+
+What the plans include:
+
+| Feature | Plans |
 |---|---|
-| `pos` | POS |
-| `basic` | Basic |
-| `premium` | Premium |
-| `platinum` | Platinum |
-| `plus` | Business Plus |
+| Online payment methods on the storefront | every website plan (`basic`, `premium`, `plus`, `platinum`, `elite`). `pos` and free stores are Cash on Delivery only |
+| Advanced inventory | Platinum, Elite, POS |
+| Store pickup / fulfil from | Platinum, Elite (with advanced inventory) |
+| POS | Platinum, Elite, POS |
+| Multi-warehouse (pooled) fulfilment | Platinum, Elite, and only when Blanxer has switched it on for the store |
 
-**"Non-premium" = empty / undefined `.plan`** (free tier, lapsed subscription, or trial without a paid plan attached). NOT "basic-tier" — `basic` is a paid plan and counts as premium for these gates.
+**"Non-premium" = empty / undefined `.plan`** (free tier, lapsed subscription, or trial without a paid plan attached). NOT "basic-tier" — `basic` is a paid plan and counts as premium for these gates. A `pos` store is paid but not a website plan: it passes only the rows marked as open to `pos` below.
 
 **What non-premium (no paid plan) loses** — every one throws `not_allowed` / an upgrade error for a plan-less store:
 
 | Capability | Source |
 |---|---|
-| Products capped at 15 total | `add-product.ts:70` |
+| Products capped at 15 total | `add-product.ts` (`isPremiumOrPos`: a `pos` store is not capped) |
 | `POST /product/{id}/bulk_add` (multipart bulk upload) | `checkPremiumOrPos()` — a `pos`-tier store now passes too |
 | Product Excel export (`export_all`, `export_edit`) | export tasks |
 | Order Excel export | export-order tasks |
 | SMS feature | `enable-sms.ts:72` |
-| Invite staff users at all | `store.routes inviteUser` |
+| Invite staff users at all | `store.routes inviteUser` (`checkPremiumOrPos()`: a `pos` store can) |
 | Files / folders (create, list, folder files) | `file.routes` |
-| Delivery charge set / read | `store.routes` |
+| Delivery charge set / read | `store.routes` (a `pos` store can read, not set) |
 | Add-ons: Blanxer Pay, SMS, eSewa, eSewa SCD | `shouldCheckPremium` |
 
-**Differences among the 5 paid plans:**
+**Differences among the 6 paid plans:**
 
 Staff-user limits (`store.controller.ts:186`):
 
@@ -348,13 +368,14 @@ Staff-user limits (`store.controller.ts:186`):
 | Basic | 5 |
 | Premium | 20 |
 | Platinum | 50 |
+| Elite | 50 |
 | POS / Business Plus | not capped in this check (effectively unlimited) |
 
 Blanxer-Pay service charge (`payment.service.ts:42`) — applied only to Blanxer-Pay gateway transactions. Store's own gateway = 0% regardless of plan:
 
 | Plan | Service charge |
 |---|---|
-| Platinum | **2.75%** (lowest) |
+| Platinum / Elite | **2.75%** (lowest) |
 | Premium | 3.0% |
 | Business Plus | 3.0% |
 | POS / Basic / default | 3.9% |
@@ -367,14 +388,14 @@ Blanxer-Pay service charge (`payment.service.ts:42`) — applied only to Blanxer
 
 **Plan-gated features that are easy to miss:**
 
-- **Advanced inventory** (`POST /inventory/enable`) — **Platinum-only** (`if (!['platinum'].includes(plan)) throw`). NOT toggleable on other paid plans. Also one-way + creates an outlet + migrates existing quantity into `OPENING_BALANCE` batches. See the `/inventory/enable` entry.
-- Once a store is in advanced-inventory mode, `stock-in`, `write-off`, `transfer-stock`, `/inventory/list`, `/inventory/summary`, `/inventory/batch` all become the source of truth. Before advanced-inventory (or on any non-Platinum store), these endpoints work but read from an empty Batch collection — stock lives directly on `product.quantity` / `variants[].quantity` instead.
+- **Advanced inventory** (`POST /inventory/enable`) — **Platinum, Elite or POS plan** (`planIncludes(plan, 'advanced_inventory')`). NOT toggleable on Basic, Premium, Business Plus or free stores. Also one-way + creates an outlet + migrates existing quantity into `OPENING_BALANCE` batches. See the `/inventory/enable` entry.
+- Once a store is in advanced-inventory mode, `stock-in`, `write-off`, `transfer-stock`, `/inventory/list`, `/inventory/summary`, `/inventory/batch` all become the source of truth. Before advanced-inventory (or on any store that can't have it), these endpoints work but read from an empty Batch collection — stock lives directly on `product.quantity` / `variants[].quantity` instead.
 
 **Agent preflight logic for uploads:**
 
 1. `GET /store/{store_id}` → read `.plan`.
 2. If `.plan` is empty → non-premium. `GET /product/pos/{store_id}` to count existing products. If `existing + planned_batch > 15`, warn and stop; don't partial-upload (leaves orphan products with no batches).
-3. If `.plan` is any of the 5 codes → treat as unlimited for products; `bulk_add` and Excel exports are allowed.
+3. If `.plan` is any of the 6 codes → treat as unlimited for products; `bulk_add` is allowed. Excel exports need a website plan (not `pos`).
 4. 500-variant and unique-SKU limits apply on every plan — validate the source file for these regardless.
 5. Don't surface payment-charge or staff-limit differences during an upload; only if the user asks about plans, staff, or charges directly.
 
@@ -742,7 +763,7 @@ Handler: `store.controller.ts getStoreDetails`. Returns the entire store documen
 }
 ```
 
-Confirmed: `.plan` is a top-level string, not nested. Empty/missing `plan` means the store has no paid subscription; any of the 5 paid codes means fully-premium.
+Confirmed: `.plan` is a top-level string, not nested. Empty/missing `plan` means the store has no paid subscription; any of the 6 paid codes means a paid plan (`pos` is paid but not a website plan).
 
 Only image-related config lives at `customization.image_ratio`:
 
@@ -767,7 +788,7 @@ Web vs POS differ only in `channel` (Website `2`, POS `3`, All `1`); everything 
 0. POST /api-key/check                     → {token, store._id}                (or reuse dashboard token)
 1. GET  /store/{store_id}                  → read .plan, .use_advanced_inventory + .website_outlet, .customization.image_ratio
 2. Detect mode: isAdvancedInventory = use_advanced_inventory === true && !!website_outlet
-                (do NOT auto-run /inventory/enable — Platinum-only, one-way, requires outlet body)
+                (do NOT auto-run /inventory/enable — plan-gated, one-way, requires outlet body)
 3. [advanced only] GET /inventory/outlets/{store_id}  → pick outlet_id
 ── per product ──
 4. POST /product/{store_id}/file           → upload each image, collect file_url[]
@@ -1299,7 +1320,7 @@ ip / user_agent: server-injected
 
 ### Store pickup (backend `claude/tsk-154`, not on `origin/dev` yet — rules in the backend's `docs/fulfilment-rules.md`)
 
-Platinum stores on advanced inventory with 2+ active outlets can let website shoppers collect an order at an outlet (Setting → Checkout → Store pickup & fulfilment).
+Platinum and Elite stores on advanced inventory with 2+ active outlets can let website shoppers collect an order at an outlet (Setting → Checkout → Store pickup & fulfilment).
 
 - **Storefront:** `check_domain` carries `store_pickup {outlets: [{_id, name, address, contact_number}], pay_at_store, advance}` (absent / empty = no pickup). The checkout sends `fulfilment: 'pickup'` + `pickup_outlet: <outlet _id>` on `POST /order/:store_id` and on the quote; `POST /order/public/pickup-stock` `{store_id, lines}` → per-outlet stock + a recommended outlet. No delivery charge; the address is still required. `paymentMethod: 'COD'` = **pay at the store** (refused when the store turned pay-at-store off; with a pickup advance it pays part online first like any advance order).
 - **The order:** `fulfilment {type: 'pickup', outlet, outlet_name}`, `order.outlet` = that outlet. Its stock comes from that outlet, and reports keep it a website (Online) sale under that outlet.
@@ -1577,7 +1598,7 @@ Subscription/SMS purchases live in `PurchaseHistory` (collection `purchase_histo
 Every `POST /payment/*/init` endpoint routes into `initForPayment(payload, type)`:
 
 - `amount = product_total_price + customization_total + delivery_charge - discount.d_value`
-- **Service-charge rate by plan**: default `0.039`, `platinum: 0.0275`, `premium: 0.03`, `plus: 0.03`.
+- **Service-charge rate by plan**: default `0.039`, `platinum: 0.0275`, `elite: 0.0275`, `premium: 0.03`, `plus: 0.03`.
 - `service_charge = 0 when with == STORE`, else `rate * amount`.
 - Creates `Transaction` with `status = AWAITING_PAYMENT (1)`, `with = tsnWith || BLANXER`, `payment_method` mapped from the init type.
 - Sets `order.transaction = trans._id`, `order.payment_status = "Processing"`.

@@ -18,7 +18,7 @@ Drop it into `~/.claude/skills/` and it activates whenever you mention Blanxer, 
 - **Offers and discount codes** — the Offers plugin (`/promotion` routes): create / update / pause offers of every kind, quote a cart before an order with a code, never send gift lines, and coupons for stores without Offers (case-insensitive codes, claimed with the order). The Blanxer MCP's offer tools come first when connected.
 - **Transactions & payments** — list, settlement history, subscription lookup, plus the "no date-filter on transaction list" limitation baked in.
 - **Analytics & reporting** — daily overview, sales-by-{product,location,staff,payment}, inventory-value, expenses-by-category, profit-loss, POS shift reconciliation.
-- **Store config** — plan detection (`pos / basic / premium / platinum / plus` vs free tier), delivery-charge matrix (Platinum-only, 6 weight tiers × per-district).
+- **Store config** — plan detection (`premium / plus / platinum / elite / basic / pos` vs free tier, `plan_info`), delivery-charge matrix (website plans, 6 weight tiers × per-district).
 
 ---
 
@@ -165,7 +165,7 @@ BLANXER_LABEL_FLAGS='{"show_store":"true","show_variant":"true"}'
 
 - **Auth exchange**: `POST /api-key/check` with the raw `sk_...` returns `{store: {...}, token: <JWT>}`. The JWT is used as `Authorization: Bearer …` for every subsequent call.
 - **Cloudflare shielding**: the entire `api.blanxer.com` surface (including `/api-key/check`) is gated by Cloudflare's browser-fingerprint challenge. All scripts send `User-Agent`, `Origin: https://app.blanxer.com`, `Referer: https://app.blanxer.com/`, and `Accept` on every request. Without these you get `403 error code: 1010`.
-- **Advanced vs simple inventory**: Platinum-only stores can enable advanced inventory (`use_advanced_inventory && website_outlet` both required for detection). In advanced mode, product-create `quantity` is forced to 0 and stock must enter via `stock-in`. In simple mode, `quantity` in the create body is applied directly. The skill branches automatically.
+- **Advanced vs simple inventory**: Platinum, Elite and POS-plan stores can enable advanced inventory (`use_advanced_inventory && website_outlet` both required for detection). In advanced mode, product-create `quantity` is forced to 0 and stock must enter via `stock-in`. In simple mode, `quantity` in the create body is applied directly. The skill branches automatically.
 - **Barcode PDF**: two-step flow (`POST /order/print_request/{store_id}` with `print_for: 2` → `GET /product/generate_barcode_quantity/{store_id}/{print_id}` with a URL-encoded `quantities` map). Cloudflare gates both the POST and the GET.
 - **Server-side image conversion**: any raster image you upload (JPG/PNG/HEIC) is auto-converted to WebP quality 95 via `sharp` on the server. Don't pre-convert. SVG passes through untouched.
 - **Product delete does NOT cascade**: `DELETE /product/{store_id}/{product_id}` only removes the Product doc — Batches, StockLedger entries, and `inventory_summary` stay behind. The skill's built-in recipe writes off remaining stock per-outlet (`subtype: SYSTEM_FIX`) first, then deletes.
