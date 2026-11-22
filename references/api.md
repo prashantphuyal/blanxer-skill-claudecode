@@ -1524,7 +1524,7 @@ Transactions are **gateway payment records** (one per online payment attempt) �
 
 | Method | Path | Roles | Purpose |
 |---|---|---|---|
-| GET | `/payment/transactions/:store_id?status=<n>&page=<n>` | owner/manager | List transactions |
+| GET | `/payment/transactions/:store_id?status=<n>&page=<n>&with=<1\|2>&from=<iso>&to=<iso>` | owner/manager | List transactions |
 | GET | `/payment/transactions/:store_id/settlement_history` | owner/manager | Settlement runs |
 | GET | `/payment/transactions/:store_id/settlement/:settlement_id` | owner/manager | Settlement detail |
 | GET | `/payment/dynamic_qr/check/:trans_id` | public | Boolean paid-yet check |
@@ -1534,7 +1534,9 @@ Transactions are **gateway payment records** (one per online payment attempt) �
 ### List transactions — `GET /payment/transactions/:store_id`
 
 ```
-→ { total: { c: <count>, a: <sumAmount>, sc: <sumServiceCharge> },
+→ { total: { c: <count>, a: <sumAmount>, sc: <sumServiceCharge> },     // every row the filters match, all pages
+    by_with: { blanxer: {c,a,sc}, store: {c,a,sc} },                    // same status + dates, ignoring `with`
+    meta: { page, per_page: 50, total },
     transactions: [
       { _id, order:{customer_full_name,customer_phone_number,order_number},
         payment_method, amount, service_charge, with, wallet_referance_code,
@@ -1542,7 +1544,11 @@ Transactions are **gateway payment records** (one per online payment attempt) �
     ] }
 ```
 
-**⚠ Filters are only `status` + `page`.** No date-range filter, no type filter, no order-side filter exist in code. `status` default is `2` (RECEIVED) if omitted or unparseable. Page size = 50. Sort `_id: -1`. **There is no "get one full transaction" endpoint** — the closest is the QR boolean check.
+**Filters (all applied by the server):** `status` (default `2` RECEIVED if omitted or unparseable), `with` (`1` Blanxer collected it, `2` the store's own gateway), `from` / `to` (ISO date or date-time on `created_at`). A bad `with` or date is ignored, it does not empty the list. **`page` starts at 0**, page size = 50, sort `_id: -1`.
+
+**⚠ Never sum or filter one page yourself.** A store can have hundreds of rows; `total` and `by_with` already cover every page. In status `2`, `by_with.blanxer.a − by_with.blanxer.sc` is what Blanxer still owes the store (a Blanxer-collected payment moves to status `4` when it is paid out); store-gateway rows stay in status `2` for good and never settle through Blanxer.
+
+No order-side filter exists. **There is no "get one full transaction" endpoint** — the closest is the QR boolean check.
 
 ```
 GET /payment/dynamic_qr/check/:trans_id       (public)
@@ -1552,13 +1558,16 @@ GET /payment/dynamic_qr/check/:trans_id       (public)
 ### Settlement history / detail
 
 ```
-GET /payment/transactions/:store_id/settlement_history
+GET /payment/transactions/:store_id/settlement_history?page=<n>      (page starts at 0, 50 per page)
 → { meta:{page,per_page,total},
-    transactions:[ Settlement{ settlement_id, total_paid, total_service_charge, total_transactions, created_at } ] }
+    summary:{ c, transactions, paid, sc, net },      // paid payouts only, all pages; net = paid − sc
+    transactions:[ Settlement{ _id, settlement_id, status, total_paid, total_service_charge, total_transactions, created_at } ] }
 
 GET /payment/transactions/:store_id/settlement/:settlement_id
 → { settlement:{…}, transactions:[ {…full incl. dump, quick_receipt_id} ] }
 ```
+
+`status` is `settled` (or absent on old payouts) when the money was sent; `failed`, `awaiting_settlement` and `pending` payouts are listed too and are **not** money received. The detail call takes the Settlement's `_id`; `settlement_id` is the bank's transfer reference.
 
 Errors with `not_allowed` if the settlement doesn't belong to the store.
 
@@ -1715,7 +1724,7 @@ Reporting-adjacent (financially aggregated) but per-entity, not store-wide dashb
 
 ## Cross-cutting caveats to code around
 
-- **Transaction list has no date filter** — only `status` + `page`. For date-scoped payment analytics, use `/pos-reports/sales-by-payment` or `/analytics/dashboard/daily`.
+- **Transaction list: filter on the server, never on a page** — `with`, `from`, `to` are query params and `total` / `by_with` cover every page (`page` starts at 0). It lists online gateway payments only; for payment analytics across every method use `/pos-reports/sales-by-payment` or `/analytics/dashboard/daily`.
 - **`/sales_overview` is public and unwrapped** — don't rely on it for authed contexts; treat with care. No auth means no store-role validation.
 - **`/analytics/:store_id` skips Zod** — send clean params. `mode` is numeric (`1`/`2`/`3`), not string.
 - **Custom line items only work on admin/POS/lead/change endpoints** — never public checkout, which requires real catalog `product_id`s.
