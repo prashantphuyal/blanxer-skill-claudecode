@@ -680,7 +680,7 @@ Write off first, then delete: the other way round leaves `inventory_summary` sta
 
 **Plan-tier gates (checked upfront in step 0 — see next section):**
 - **No paid plan** (`store.plan` empty/undefined) → hard cap of **15 products total**, no `bulk_add`, no SMS, no Excel export.
-- **Any of the 6 paid plans** (`premium`, `plus`, `platinum`, `elite`, and the two no longer on the pricing page: `basic`, `pos`) → unlimited products, `bulk_add` allowed. SMS and Excel export need a website plan (every paid plan except `pos`).
+- **Any of the 7 paid plans** (`premium`, `plus`, `platinum`, `elite`, and the three not on the pricing page: `enterprise`, `basic`, `pos`) → unlimited products, `bulk_add` allowed. SMS and Excel export need a website plan (every paid plan except `pos`).
 
 ### Bulk endpoints — use these instead of looping (added 2026-09/10)
 
@@ -841,7 +841,7 @@ Authorization: Bearer <token>
 
 **How to gate on it:**
 
-- **`plan` is one of** `"premium"` / `"plus"` / `"platinum"` / `"elite"` / `"basic"` / `"pos"` → paid plan. Skip the product-count check; `bulk_add` allowed. SMS and Excel export are allowed on the website plans (all of these except `"pos"`).
+- **`plan` is one of** `"premium"` / `"plus"` / `"platinum"` / `"elite"` / `"enterprise"` / `"basic"` / `"pos"` → paid plan. Skip the product-count check; `bulk_add` allowed. SMS and Excel export are allowed on the website plans (all of these except `"pos"`).
 - **`plan` is** `""` / `null` / `undefined` / missing → non-premium (free / lapsed / trial-without-plan). Also run `GET /product/pos/{store_id}` to count existing products. If `existing_count + planned_batch > 15`, **STOP and warn**: *"Store has no paid plan; capped at 15 products total. You have N; adding M would exceed the cap. Trim the batch or ask about upgrading."* Do not partial-upload — mid-batch failures leave orphan products with no batches.
 
 For non-premium stores also disable any suggestions of `bulk_add`, SMS blasts, or Excel exports later in the flow — they'll all `not_allowed` regardless.
@@ -852,16 +852,20 @@ For non-premium stores also disable any suggestions of `bulk_add`, SMS blasts, o
 
 ```python
 plan = (store.get("plan") or "").lower()
+# plan_info.features is the store's own answer (it counts an add-on given on top of the plan);
+# the plan list is only for a response without plan_info
+features = (store.get("plan_info") or {}).get("features") or {}
+plan_allows = features.get("advanced_inventory", plan in {"platinum", "elite", "enterprise", "pos"})
 is_advanced_inventory = (
-    plan in {"platinum", "elite", "pos"}
+    plan_allows
     and store.get("use_advanced_inventory") is True
     and bool(store.get("website_outlet"))
 )
 ```
 
-**The rule is the backend's: advanced = `use_advanced_inventory === true` AND `website_outlet` set** (every checkout, POS and stock path uses exactly this). Advanced inventory can be turned on for **Platinum, Elite and POS** plans (`planIncludes(plan, 'advanced_inventory')`); a store with the flag but no `website_outlet` is half-migrated: treat it as non-advanced. The plan check in the snippet above is a safety net for data drift on other plans, not the rule.
+**The rule is the backend's: advanced = `use_advanced_inventory === true` AND `website_outlet` set** (every checkout, POS and stock path uses exactly this). Advanced inventory can be turned on for **Platinum, Elite, Enterprise and POS** plans, and for any store Blanxer gave it to as an add-on (`plan_info.addons`), (`planIncludes(plan, 'advanced_inventory')`); a store with the flag but no `website_outlet` is half-migrated: treat it as non-advanced. The plan check in the snippet above is a safety net for data drift on other plans, not the rule.
 
-**⚠ Never auto-run `POST /inventory/enable`.** Platinum, Elite or POS plan, NOT bodyless (outlet fields), and **one-way**: it seeds `OPENING_BALANCE` batches from current quantities and sets `website_outlet`. Two BETA stores are blocked. From 2026-10-18 it can be retried after a failure, reuses a store's single existing outlet (POS-signup stores), counts stock already in batches only once, and sets every total from the batches. If the user asks for it, hand them the payload and confirm the outlet fields; never fire it as a side-effect of an upload.
+**⚠ Never auto-run `POST /inventory/enable`.** Platinum, Elite, Enterprise or POS plan (or the add-on), NOT bodyless (outlet fields), and **one-way**: it seeds `OPENING_BALANCE` batches from current quantities and sets `website_outlet`. Two BETA stores are blocked. From 2026-10-18 it can be retried after a failure, reuses a store's single existing outlet (POS-signup stores), counts stock already in batches only once, and sets every total from the batches. If the user asks for it, hand them the payload and confirm the outlet fields; never fire it as a side-effect of an upload.
 
 **Branch on the two flows:**
 
@@ -882,7 +886,7 @@ req = urllib.request.Request(
              "User-Agent": UA, "Origin": "https://app.blanxer.com", "Referer": "https://app.blanxer.com/"})
 store = json.loads(urllib.request.urlopen(req).read())
 plan = store.get("plan") or ""
-is_premium = plan in {"premium", "plus", "platinum", "elite", "basic", "pos"}  # any paid plan
+is_premium = plan in {"premium", "plus", "platinum", "elite", "enterprise", "basic", "pos"}  # any paid plan
 ```
 
 **Do not surface** staff-user limits or payment service-charge tier differences during an upload — they're irrelevant to the product flow. Only mention them if the user asks about plans, staff, or payment charges specifically. Reference table (for on-demand answers):
@@ -893,6 +897,7 @@ is_premium = plan in {"premium", "plus", "platinum", "elite", "basic", "pos"}  #
 | Business Plus (`plus`) | unlimited | 3.0% | 48,000 / 28,800 |
 | Platinum (`platinum`) | 50 | **2.75%** (lowest) | 78,000 / 46,800 |
 | Elite (`elite`) | 50 | **2.75%** (lowest) | 98,000 / 58,800 |
+| Enterprise (`enterprise`, agreed with Blanxer; everything Elite has) | unlimited | **2.75%** (lowest) | never quote: the price is agreed per client |
 | Basic (`basic`, no longer sold; its stores keep it and can renew) | 5 | 3.9% | renews at 14,400 |
 | POS (`pos`, sales team only) | unlimited | 3.9% | never quote (see Product channel above) |
 | (No plan) | can't invite | n/a | n/a |
