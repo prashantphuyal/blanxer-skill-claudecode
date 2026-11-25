@@ -163,7 +163,7 @@ The `items` array can take multiple entries — useful if you ever batch the sto
 - `GET /product/{store_id}/seo_audit` — one pass over the catalogue with the SEO/content state of every product. Any store role, no params.
 - `GET /product/{store_id}/catalog_export` — catalogue export.
 - `GET /product/public/barcode/{store_id}?code=<barcode>` — public barcode/alt-barcode lookup (POS scan path). Matches the product `barcode`, `alt_barcode`, or a variant barcode.
-- `POST /product/general/{store_id}/{product_id}` — name/description/price/images/categories.
+- `POST /product/general/{store_id}/{product_id}` — name/description/images/categories. Full write: `long_description` defaults to `""` and `categories` to `[]`, so resend both (and `brand`) or they are wiped. Optional `image_alts` (aligned with `image_urls`; left out = realigned by URL).
 - `POST /product/variant_inventory/{store_id}/{product_id}` — variants + pricing + stock (non-advanced stores). Send the full payload plus `expected_quantity` (root and per variant) = the stock you read. From 2026-10-18: unsent fields are left alone, stock moves by `quantity − expected_quantity`, variants match by `_id`, and dropping a stocked variant answers 409 `REMOVE_STOCKED_VARIANTS` (resend with `confirm: [code]` on the user's yes). See SKILL.md handler #2.
 - `POST /product/custom_fields/{store_id}/{product_id}` — **tags**, custom fields, similar products, release date. See "Product tags" below.
 - `POST /product/status_metadata/{store_id}/{product_id}` — `status`, `seo_title`, `seo_description`, `seo_image`, `desc_page` only. No `tags`, no `release_date`.

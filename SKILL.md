@@ -72,7 +72,7 @@ When the source is a spreadsheet full of external image URLs (Daraz-style `stati
 2. **Auto-trim dark background** so the product isn't dwarfed by studio backdrop. Marketplace studio shots frequently have 15–40% black/dark-gray padding on the sides (e.g. bag photos with a black-on-black backdrop). Use a brightness-threshold bbox trim (Pillow snippet below). Skip if the source is already a clean lifestyle shot.
 3. **Center-crop to the store's `image_ratio`** using `ImageOps.fit`. Ratios: `1`→`(1,1)`, `2`→`(4,5)`, `3`→`(9,16)`. Resize the long edge to ~1200–1600 px.
 4. **Already uploaded?** Before uploading, look the photo up: `GET /file/{store_id}/images?source_hash=<sha-256 hex of the original file, before cropping>` (or `?q=<part of the file name>`). A hit's `items[0].file_url` goes straight into `image_urls`; don't upload a copy. Older backends answer this route with an error: just upload.
-5. **Upload** each cropped file to `POST /product/{store_id}/file` (multipart, `upload_purpose=product_image`, plus `source_hash=<that sha-256>` so it's found next time). Response is `{file: {file_url: "https://cdn2.blanxer.com/uploads/<store_id>/product_image-<name>-<nnnn>.webp", ...}}` — server auto-converts to WebP q95.
+5. **Upload** each cropped file to `POST /product/{store_id}/file` (multipart, `upload_purpose=product_image`, plus `source_hash=<that sha-256>` so it's found next time). Response is `{file: {file_url: "https://<cdn host>/uploads/<store_id>/product_image-<name>-<nnnn>.webp", ...}}` — server auto-converts to WebP q95. **Store `file_url` exactly as returned; never build or rewrite the host yourself.** The host moved in 2026-11 (`cdn2.blanxer.com` → `d1ini6dz8s87i5.cloudfront.net`, see "Auditing and repairing broken product images").
 6. **Create the product** with `image_urls: [<file_url1>, <file_url2>, ...]` in the order you want them shown. First URL is the thumbnail.
 
 **Pillow helper — dark-background trim + ratio crop:**
@@ -564,13 +564,15 @@ There's **no single "update product"** route. Editing one existing product is sp
   "name": "...",                          // required, max 2000
   "slug": "...",                          // required, min 4 (slugified server-side; unique per store)
   "description": "...",                   // required
-  "long_description": "",                 // optional
+  "long_description": "",                 // optional BUT defaults to "" — omit it and the existing long description is WIPED; always resend it
   "categories": ["<cat_id>"],             // string[] of category ids (unknown ids stored silently — see category note above)
   "brand": "<brand_id>",                  // optional, must belong to store
   "channel": 1,                           // 1=All, 2=Website, 3=POS
   "image_urls": ["https://.../x.webp"]    // full S3 URLs; index 0 = primary/thumbnail
 }
 ```
+
+**Handler #1 is a full write of every field above.** To change only the photos, first `GET /product/{store_id}/{product_id}` and resend `name`, `slug`, `description`, `long_description`, `categories` (ids), `brand` (id, if set) and `channel` unchanged with the new `image_urls`. Optional `image_alts: string[]` (aligned with `image_urls`): leave it out and each kept photo keeps its alt by URL; send it when you replace a photo and want the old alt on the new one. On a bundle offer's product the photos (first 8) also become the offer's `bundle.images`, and a description of 500 characters or fewer becomes the offer's description.
 
 **2. `POST /product/variant_inventory/{store_id}/{product_id}`** — variants + inventory + pricing. (`edit-product-variant-inventory.ts`, auth: owner/manager)
 
@@ -991,6 +993,50 @@ Print requests are one-shot but **fully independent of the upload session** — 
 
 Both need CF browser headers on POST + GET. Full recipe (product-ID discovery via `/product/pos/{store_id}` or `/product/{store_id}/{product_id}`, mode selection, variant keying) in `references/api.md` under "Reprinting barcodes on demand".
 
+## Auditing and repairing broken product images
+
+Use when the user says product photos are missing / broken / "check the images online", or after a CDN change. Verified 2026-11-25.
+
+**What happened to the CDN (2026-11):** `cdn2.blanxer.com` is a CNAME to a CloudFront distribution that no longer resolves (no A record, also from public DNS such as `dns.google`). Every `image_urls` entry, logo, favicon and hero image still on `cdn2` is broken on the storefront. New uploads (`POST /product/{store}/file`, `POST /file`) now return `https://d1ini6dz8s87i5.cloudfront.net/...`, which works, but **the old `cdn2` keys answer 403 on the new host**, so swapping the host in old URLs does not fix them. The files are gone from what the CDN serves. `https://cdn-cf.blanxer.com/...` (R2: BlanxerAI images, `ai-images/` and `ai-library/`) is unaffected. Check this again before relying on it; infra may restore the old files.
+
+**Recipe:**
+
+1. `GET /product/pos/{store_id}` → ids; `GET /product/{store_id}/{id}` for each (full `image_urls`, `image_alts`, `bundle`, `long_description`).
+2. Fetch every URL with the browser headers. Count 2xx as live. Retry DNS errors 3 times before calling a URL dead (resolvers flap). Report per product: live / dead / none.
+3. Decide per product:
+   - Some live → keep only the live URLs, in their order.
+   - None live, **bundle** (`bundle.items` set) → make a set photo from its items' live photos (free composite below), or `POST /promotion/{store}/bundle-image` (BlanxerAI, **charged to the store's AI allowance**: ask first).
+   - None live, plain product → look for the same product's photo elsewhere in the store (a duplicate or older listing), else ask the user for photos. Don't invent product photos.
+   - No photos at all on a POS-only (`channel: 3`) product → leave it.
+4. Write back with handler #1 (`POST /product/general/...`), resending every field (see the warning there). Test on one product, read it back (photos changed, `long_description` and name unchanged), then do the rest.
+5. Fetch every URL again and confirm all are 2xx. Then grep the storefront HTML (`curl -sL https://<domain> -A "Mozilla/5.0"`) for leftover `cdn2.blanxer.com` links: logo, favicon and hero images live in store customization, not on products. Tell the user those need re-uploading in Store Settings / Appearance. The API key flow doesn't cover them here.
+
+**Free bundle photo from the items' own photos.** Works when the item photos are clean white-background studio shots (BlanxerAI `product_studio` photos are). Match the store's other photos: same canvas (`image_ratio` 2 → 1024×1280 for photos made at that size; check what the others actually are) and a similar fill (about 90% of the width for a set). Lay items side by side without overlap: multiply-blending on white keeps their soft shadows, and overlapping white packaging would show through. Use only the items in `bundle.items`; a promo gift named in the description (e.g. "free oil") is not part of the bundle.
+
+```python
+from PIL import Image, ImageChops, ImageOps
+def cut(path, thr=242):                       # crop to the non-white product
+    im = Image.open(path).convert("RGB")
+    m = ImageOps.invert(im.convert("L")).point(lambda p: 255 if p > 255 - thr else 0)
+    return im.crop(m.getbbox())
+def set_photo(items, out, W=1024, H=1280, side=50, top=150, bottom=1160, gap=40):
+    """items: [(photo_path, relative_height)], e.g. 500 ml bottle 1000, 500 ml jar 600, 50 ml oil 780."""
+    parts = [(c := cut(p)).resize((int(c.width * h / c.height), h), Image.LANCZOS) for p, h in items]
+    total = sum(c.width for c in parts) + gap * (len(parts) - 1)
+    s = min((W - 2 * side) / total, (bottom - top) / max(c.height for c in parts))
+    parts = [c.resize((round(c.width * s), round(c.height * s)), Image.LANCZOS) for c in parts]
+    gap = round(gap * s); x = (W - sum(c.width for c in parts) - gap * (len(parts) - 1)) // 2
+    canvas = Image.new("RGB", (W, H), "white")
+    for c in parts:                               # bottoms aligned on one baseline
+        layer = Image.new("RGB", (W, H), "white"); layer.paste(c, (x, bottom - c.height))
+        canvas = ImageChops.multiply(canvas, layer); x += c.width + gap
+    canvas.save(out, "JPEG", quality=93)
+```
+
+Look at the result next to the store's other photos before uploading. Upload it with `POST /product/{store}/file` and set it with handler #1.
+
+**Not usable for this:** `POST /ai/{store}/library/upload` (base64 → R2) answered 400 "Could not read that image" for valid JPEG/WebP on prod (2026-11-25).
+
 ## Offers and discount codes
 
 Blanxer's **Offers** plugin replaces coupons: automatic discounts, discount codes, buy more save more (tiers), buy X get Y, bundles, free gifts and free delivery, on the website, manual orders and POS. **The server prices everything; never compute a discount yourself.** Full routes and bodies: `references/api.md` → "Offers".
@@ -1021,6 +1067,7 @@ Since backend PR #360 (2026-11-01) keeping bank / wallet / cash balances in Blan
 - **Bearer token expired (401)**: Tell the user to reload the Blanxer tab (it'll refresh the token), then retry the loop from where it stopped. Don't silently re-run successful items.
 - **Duplicate name**: Blanxer permits duplicates by default but it's confusing for the user. If the CSV has duplicate product names, surface that in step 3 and ask whether to suffix them.
 - **Non-numeric qty/price**: Skip those rows in step 1 with a count, surfaced in the dry-run summary.
+- **Photos broken on the storefront / image URL won't resolve**: probably the 2026-11 CDN move, not your upload. See "Auditing and repairing broken product images".
 - **Missing outlet match**: Don't pick an outlet on the user's behalf if the name is ambiguous. Show all options.
 - **Network reader being flooded**: When debugging, the tab makes background polling GETs to `/store/{id}` that drown out the interesting POSTs. Use a fetch interceptor (`window.fetch = ...`) to filter to non-GET methods if you need to look at request bodies live.
 
